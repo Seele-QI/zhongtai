@@ -8,7 +8,6 @@ import {
   Video,
   Users,
   LayoutDashboard,
-  Settings,
   LifeBuoy,
   Sparkles,
   ChevronDown,
@@ -55,7 +54,6 @@ const mainNav: NavItem[] = [
 ]
 
 const bottomNav: NavItem[] = [
-  { label: "自动保存图片", icon: Settings, iconColor: "text-teal-500", iconBg: "bg-teal-500/10" },
   { label: "账号绑定", icon: Link, iconColor: "text-blue-500", iconBg: "bg-blue-500/10" },
   { label: "帮助中心", icon: LifeBuoy, iconColor: "text-sky-500", iconBg: "bg-sky-500/10" },
 ]
