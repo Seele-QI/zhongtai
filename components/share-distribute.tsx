@@ -5,7 +5,8 @@ import QRCode from "qrcode"
 import { Share2, Upload, Copy, Download, Check, Loader2, Link, QrCode, FileText, Tag, Film, Plus, Sparkles } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { toast } from "@/hooks/use-toast"
-import { loadShareVideos, type ShareVideo } from "@/components/video-history"
+import { getShareVideos } from "@/lib/video/storage"
+import type { ShareVideo } from "@/lib/video/types"
 import { getFastapiBase } from "@/lib/fastapi-base"
 
 /* ------------------------------------------------------------------ */
@@ -34,7 +35,7 @@ export function ShareDistribute() {
 
   const canGenerate = Boolean(selectedVideo && title.trim())
 
-  React.useEffect(() => { setVideos(loadShareVideos()) }, [])
+  React.useEffect(() => { setVideos(getShareVideos()) }, [])
   React.useEffect(() => {
     return () => {
       for (const url of manualObjectUrlsRef.current) URL.revokeObjectURL(url)
