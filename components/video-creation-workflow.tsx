@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/hooks/use-toast"
 import { addHistoryRecord, addShareVideo } from "@/components/video-history"
+import { loadTask, saveTask, clearTask, type VideoTaskState } from "@/lib/video-task-store"
 import { getFastapiBase } from "@/lib/fastapi-base"
 
 /* ------------------------------------------------------------------ */
@@ -208,33 +209,63 @@ function UploadZone({
 /* ------------------------------------------------------------------ */
 
 export function VideoCreationWorkflow({ initialScript }: Props) {
-  // Step 1 state
+  // Persisted task state — survives tab switch, browser refresh, browser close.
+  // Initialised from localStorage on mount; updated on every change.
+  const [taskState, setTaskState] = React.useState<VideoTaskState>(() => {
+    const saved = loadTask()
+    if (saved) return saved
+    const now = Date.now()
+    return {
+      taskId: "", status: "pending", progress: 0, isProcessing: false, errorMessage: "",
+      videoUrl: "", coverUrl: "", script: initialScript ?? "", gender: "female",
+      imageBase64: "", imagePreview: "", audioBase64: "", audioName: "", audioDuration: "",
+      selectedPreset: "", isEditing: false, qrDataUrl: "", shareUrl: "", copied: false,
+      createdAt: now, updatedAt: now,
+    }
+  })
+
+  // Persist on every change (auto-save)
+  React.useEffect(() => { saveTask(taskState) }, [taskState])
+
+  // Convenience setters — keep call sites short, persist transparently
+  const updateTask = React.useCallback((patch: Partial<VideoTaskState>) => {
+    setTaskState((prev) => ({ ...prev, ...patch }))
+  }, [])
+
+  // Legacy aliases for source-level readability
+  const taskId = taskState.taskId
+  const script = taskState.script
+  const gender = taskState.gender
+  const progress = taskState.progress
+  const videoUrl = taskState.videoUrl
+  const coverUrl = taskState.coverUrl
+  const isProcessing = taskState.isProcessing
+  const errorMessage = taskState.errorMessage
+  const selectedPreset = taskState.selectedPreset
+  const isEditing = taskState.isEditing
+  const setScript = (v: string) => updateTask({ script: v })
+  const setGender = (v: "male" | "female") => updateTask({ gender: v })
+  const setTaskId = (v: string) => updateTask({ taskId: v })
+  const setProgress = (v: number | ((p: number) => number)) =>
+    updateTask({ progress: typeof v === "function" ? v(taskState.progress) : v })
+  const setVideoUrl = (v: string) => updateTask({ videoUrl: v })
+  const setCoverUrl = (v: string) => updateTask({ coverUrl: v })
+  const setIsProcessing = (v: boolean) => updateTask({ isProcessing: v })
+  const setErrorMessage = (v: string) => updateTask({ errorMessage: v })
+  const setSelectedPreset = (v: string | null) => updateTask({ selectedPreset: v || "" })
+  const setIsEditing = (v: boolean) => updateTask({ isEditing: v })
+
+  // 临时未持久化的状态
   const [image, setImage] = React.useState<UploadedImage | null>(null)
   const [audio, setAudio] = React.useState<UploadedAudio | null>(null)
-  const [script, setScript] = React.useState(initialScript ?? "")
-  const [gender, setGender] = React.useState<"male" | "female">("female")
-
-  // Workflow state
   const [activeStep, setActiveStep] = React.useState<StepId>(1)
   const [stepStatuses, setStepStatuses] = React.useState<Record<StepId, StepStatus>>({
-    1: "active",
-    2: "pending",
-    3: "pending",
-    4: "pending",
+    1: "active", 2: "pending", 3: "pending", 4: "pending",
   })
-  const [isProcessing, setIsProcessing] = React.useState(false)
-  const [errorMessage, setErrorMessage] = React.useState("")
-  const [selectedPreset, setSelectedPreset] = React.useState<string | null>(null)
-  const [taskId, setTaskId] = React.useState("")
-  const [progress, setProgress] = React.useState(0)
-  const [videoUrl, setVideoUrl] = React.useState("")
-  const [isEditing, setIsEditing] = React.useState(false)
-  const [coverUrl, setCoverUrl] = React.useState("")
-
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
-  const taskIdRef = React.useRef(taskId)
-  taskIdRef.current = taskId
-  const scriptRef = React.useRef(script)
+  const taskIdRef = React.useRef(taskState.taskId)
+  taskIdRef.current = taskState.taskId
+  const scriptRef = React.useRef(taskState.script)
   scriptRef.current = script
   const genderRef = React.useRef(gender)
   genderRef.current = gender

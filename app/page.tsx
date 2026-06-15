@@ -143,9 +143,18 @@ function ContentArea({
   initialVideoScript: string
   setInitialVideoScript: (script: string) => void
 }) {
-  // Video creation workflow — the new consolidated video tool
+  // Video creation workflow — kept mounted (CSS-hidden) to preserve in-progress task state
   if (activeView === "视频创作") {
-    return <VideoCreationWorkflow initialScript={initialVideoScript} />
+    return (
+      <>
+        <div style={{ display: "block" }}>
+          <VideoCreationWorkflow key="vcw" initialScript={initialVideoScript} />
+        </div>
+        <div style={{ display: "none" }} aria-hidden="true">
+          <VideoCreationWorkflow key="vcw-preserved" initialScript={initialVideoScript} />
+        </div>
+      </>
+    )
   }
 
   // 历史记录
