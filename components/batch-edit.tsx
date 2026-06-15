@@ -4,14 +4,48 @@ import * as React from "react"
 import { Upload, X, Play, Shuffle, Layers, Film, CheckCircle2, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { toast } from "@/hooks/use-toast"
-import { addShareVideo, addHistoryRecord } from "@/lib/video/storage"
-import type { ShareVideo, ClipItem } from "@/lib/video/types"
-import { generatePermutations, factorial, isHttpUrl } from "@/lib/video/utils"
-import { ACCEPTED_CLIPS, MAX_CLIPS_COUNT, MAX_CLIPS_SIZE } from "@/lib/video/constants"
+import { addShareVideo, addHistoryRecord, type ShareVideo } from "@/components/video-history"
+
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
+type ClipItem = { id: string; name: string; previewUrl: string; file: File }
+
+/* ------------------------------------------------------------------ */
+/*  Permutation helper                                                  */
+/* ------------------------------------------------------------------ */
+
+function generatePermutations<T>(arr: T[], maxCount = 20): T[][] {
+  if (arr.length <= 1) return [arr]
+  const results: T[][] = []
+  function permute(prefix: T[], remaining: T[]) {
+    if (results.length >= maxCount) return
+    if (remaining.length === 0) {
+      results.push(prefix)
+      return
+    }
+    for (let i = 0; i < remaining.length; i++) {
+      const next = remaining.slice(0, i).concat(remaining.slice(i + 1))
+      permute([...prefix, remaining[i]], next)
+      if (results.length >= maxCount) return
+    }
+  }
+  permute([], arr)
+  return results
+}
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
+
+const ACCEPTED_FILES = "video/*,image/*"
+const MAX_CLIPS = 10
+const MAX_SIZE = 100 * 1024 * 1024 // 100MB
+
+function isHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url)
+}
 
 export function BatchEdit() {
   const [clips, setClips] = React.useState<ClipItem[]>([])
@@ -38,11 +72,11 @@ export function BatchEdit() {
     const newClips: ClipItem[] = []
     for (let i = 0; i < files.length; i++) {
       const f = files[i]
-      if (clips.length + newClips.length >= MAX_CLIPS_COUNT) {
-        toast({ title: `最多上传 ${MAX_CLIPS_COUNT} 个素材`, variant: "destructive" })
+      if (clips.length + newClips.length >= MAX_CLIPS) {
+        toast({ title: `最多上传 ${MAX_CLIPS} 个素材`, variant: "destructive" })
         break
       }
-      if (f.size > MAX_CLIPS_SIZE) {
+      if (f.size > MAX_SIZE) {
         toast({ title: `${f.name} 超过 100MB`, variant: "destructive" })
         continue
       }
@@ -142,10 +176,10 @@ export function BatchEdit() {
           >
             <Upload className="h-10 w-10 text-violet-400" />
             <p className="text-[14px] font-medium text-slate-600 dark:text-slate-300">拖拽素材到此处，或点击上传</p>
-            <p className="text-[12px] text-slate-400">支持视频/图片 · 单个最大 100MB · 最多 {MAX_CLIPS_COUNT} 个</p>
+            <p className="text-[12px] text-slate-400">支持视频/图片 · 单个最大 100MB · 最多 {MAX_CLIPS} 个</p>
             <input
               type="file"
-              accept={ACCEPTED_CLIPS}
+              accept={ACCEPTED_FILES}
               multiple
               className="hidden"
               onChange={(e) => handleAddFiles(e.target.files)}
@@ -237,4 +271,8 @@ export function BatchEdit() {
       </div>
     </div>
   )
+}
+
+function factorial(n: number): number {
+  let r = 1; for (let i = 2; i <= n; i++) r *= i; return r
 }
