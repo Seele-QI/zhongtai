@@ -232,6 +232,14 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const [coverUrl, setCoverUrl] = React.useState("")
 
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
+  const taskIdRef = React.useRef(taskId)
+  taskIdRef.current = taskId
+  const scriptRef = React.useRef(script)
+  scriptRef.current = script
+  const genderRef = React.useRef(gender)
+  genderRef.current = gender
+  const coverUrlRef = React.useRef(coverUrl)
+  coverUrlRef.current = coverUrl
 
   // Reset script when initialScript changes (from cross-navigation)
   React.useEffect(() => {
@@ -275,6 +283,56 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
   }, [])
 
+  /** Background poll — survives component re-render (when user switches sidebar tabs) */
+  const startBackgroundPoll = React.useCallback((tid: string) => {
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      const base = getFastapiBase()
+      if (!base) return
+      try {
+        const sr = await fetch(`${base}/api/video/status?taskId=${tid}`)
+        const sd = await sr.json()
+        if (!sr.ok) return
+        const s = sd.status?.toLowerCase()
+        if (s === "success") {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          const vUrl = sd.video_url || sd.videoUrl || ""
+          const cUrl = sd.cover_url || sd.coverUrl || ""
+          setVideoUrl(vUrl)
+          if (cUrl) setCoverUrl(cUrl)
+          setProgress(100)
+          setStepStatuses((prev) => ({ ...prev, 3: "done", 4: "active" }))
+          setActiveStep(4)
+          setIsProcessing(false)
+          addHistoryRecord({
+            id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
+            videoUrl: vUrl, coverUrl: cUrl, gender: genderRef.current, status: "success",
+          })
+          if (vUrl) {
+            addShareVideo({
+              id: tid, title: scriptRef.current.trim().slice(0, 30),
+              url: vUrl, thumbnail: cUrl || undefined, source: "video-creation", createdAt: Date.now(),
+            })
+          }
+        } else if (s === "failed") {
+          clearInterval(pollRef.current!)
+          pollRef.current = null
+          const errMsg = sd.error || sd.detail || "生成失败"
+          setErrorMessage(errMsg)
+          setStepStatuses((prev) => ({ ...prev, 3: "error" }))
+          setIsProcessing(false)
+          addHistoryRecord({
+            id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
+            videoUrl: "", coverUrl: "", gender: genderRef.current, status: "failed", errorMessage: errMsg,
+          })
+        } else if (typeof sd.progress === "number") {
+          setProgress((p) => Math.max(p, sd.progress))
+        }
+      } catch { /* ignore polling errors */ }
+    }, 5000)
+  }, [])
+
   const handleGenerate = React.useCallback(async () => {
     if (!canGenerate || isProcessing) return
     const base = getFastapiBase()
@@ -311,67 +369,8 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       setStepStatuses((prev) => ({ ...prev, 2: "done", 3: "loading" }))
       setActiveStep(3)
 
-      // Poll every 5s
-      pollRef.current = setInterval(async () => {
-        try {
-          const sr = await fetch(`${base}/api/video/status?taskId=${tid}`)
-          const sd = await sr.json()
-          if (!sr.ok) return
-          const s = sd.status?.toLowerCase()
-          if (s === "success") {
-            clearInterval(pollRef.current!)
-            pollRef.current = null
-            const vUrl = sd.video_url || sd.videoUrl || ""
-            const cUrl = sd.cover_url || sd.coverUrl || ""
-            setVideoUrl(vUrl)
-            if (cUrl) setCoverUrl(cUrl)
-            setProgress(100)
-            setStepStatuses((prev) => ({ ...prev, 3: "done", 4: "active" }))
-            setActiveStep(4)
-            setIsProcessing(false)
-            // Save to history
-            addHistoryRecord({
-              id: tid,
-              createdAt: Date.now(),
-              script: script.trim(),
-              videoUrl: vUrl,
-              coverUrl: cUrl,
-              gender,
-              status: "success",
-            })
-            // Also save to share-videos for 一键分发
-            if (vUrl) {
-              addShareVideo({
-                id: tid,
-                title: script.trim().slice(0, 30),
-                url: vUrl,
-                thumbnail: cUrl || undefined,
-                source: "video-creation",
-                createdAt: Date.now(),
-              })
-            }
-          } else if (s === "failed") {
-            clearInterval(pollRef.current!)
-            pollRef.current = null
-            const errMsg = sd.error || sd.detail || "生成失败"
-            setErrorMessage(errMsg)
-            setStepStatuses((prev) => ({ ...prev, 3: "error" }))
-            setIsProcessing(false)
-            addHistoryRecord({
-              id: tid,
-              createdAt: Date.now(),
-              script: script.trim(),
-              videoUrl: "",
-              coverUrl: "",
-              gender,
-              status: "failed",
-              errorMessage: errMsg,
-            })
-          } else if (typeof sd.progress === "number") {
-            setProgress((p) => Math.max(p, sd.progress))
-          }
-        } catch { /* ignore polling errors */ }
-      }, 5000)
+      // Start background poll using refs — survives re-render when navigating away
+      startBackgroundPoll(tid)
     } catch (e) {
       setErrorMessage(e instanceof Error ? e.message : "生成过程出错，请重新点击生成")
       setStepStatuses((prev) => ({ ...prev, 3: "error" }))
