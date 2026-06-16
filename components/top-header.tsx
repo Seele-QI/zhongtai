@@ -3,6 +3,7 @@
 import { Github } from "lucide-react"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { GlobalSearchBar } from "@/components/global-search-bar"
+import { CreditBadge } from "@/components/credit/credit-badge"
 import type { MainView } from "@/components/dashboard-sidebar"
 
 const openSourceRepoUrl = (process.env.NEXT_PUBLIC_OPEN_SOURCE_REPO_URL || "").trim()
@@ -78,6 +79,7 @@ export function TopHeader({
       />
 
       <div className="flex items-center gap-2">
+        <CreditBadge />
         <ThemeToggle />
       </div>
     </header>

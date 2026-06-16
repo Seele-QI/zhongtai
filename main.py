@@ -6,12 +6,20 @@ import logging
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from lib.runninghub_client import RunningHubClient, RunningHubError, build_motion_prompt, build_cover_prompt
+
+from lib.auth import (
+    SESSION_COOKIE, create_session, destroy_session, get_current_user, get_or_create_user,
+    save_sms_code, verify_sms_code, mask_phone,
+)
+from lib.credit import get_account, list_ledger
+from lib.rate_limit import check_ip, check_phone
+from lib.sms import generate_code, send as sms_send
 
 load_dotenv()
 
@@ -744,6 +752,119 @@ async def share_redirect(token: str):
         "Cache-Control": "no-store",
     }
     return HTMLResponse(content=landing_html, status_code=200, media_type="text/html; charset=utf-8", headers=headers)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  积分系统：认证与积分 API
+# ════════════════════════════════════════════════════════════════════════
+
+
+class SendCodeRequest(BaseModel):
+    phone: str
+
+
+@app.post("/api/auth/send-code")
+async def auth_send_code(req: SendCodeRequest, request: Request):
+    """发送短信验证码。永远返回 ok=True，不告诉前端是限频了还是手机号错了。"""
+    phone = (req.phone or "").strip()
+    if not phone or not phone.isdigit() or len(phone) != 11:
+        return {"ok": True}
+    from lib.auth import hash_phone
+    phone_h = hash_phone(phone)
+    ok, _ = check_phone(phone_h)
+    if not ok:
+        return {"ok": True}
+    ip = request.client.host if request.client else ""
+    ok, _ = check_ip(ip)
+    if not ok:
+        return {"ok": True}
+    code = generate_code()
+    save_sms_code(phone, code)
+    sms_send(phone, code)
+    return {"ok": True}
+
+
+class VerifyCodeRequest(BaseModel):
+    phone: str
+    code: str
+
+
+@app.post("/api/auth/verify-code")
+async def auth_verify_code(req: VerifyCodeRequest, request: Request, response: Response):
+    """验证并登录。"""
+    phone = (req.phone or "").strip()
+    code = (req.code or "").strip()
+    if not phone or not code:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "手机号或验证码为空"})
+    if not verify_sms_code(phone, code):
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CODE", "message": "验证码错误或已过期"})
+    user_id = get_or_create_user(phone)
+    ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else ""
+    sid = create_session(user_id, ua, ip)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=sid,
+        max_age=30 * 86400,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    acct = get_account(user_id)
+    return {
+        "user": {"id": user_id, "phone_masked": mask_phone(phone)},
+        "balance": acct.balance,
+    }
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response):
+    sid = request.cookies.get(SESSION_COOKIE)
+    if sid:
+        destroy_session(sid)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail={"code": "NOT_LOGGED_IN", "message": "未登录"})
+    acct = get_account(user.id)
+    return {
+        "user": {
+            "id": user.id,
+            "phone_masked": user.phone_masked,
+            "nickname": user.nickname,
+        },
+        "balance": acct.balance,
+    }
+
+
+@app.get("/api/credit/balance")
+async def credit_balance(request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail={"code": "NOT_LOGGED_IN", "message": "未登录"})
+    acct = get_account(user.id)
+    return {
+        "balance": acct.balance,
+        "total_recharged": acct.total_recharged,
+        "total_bonus": acct.total_bonus,
+        "total_consumed": acct.total_consumed,
+    }
+
+
+@app.get("/api/credit/ledger")
+async def credit_ledger(request: Request, limit: int = 20):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail={"code": "NOT_LOGGED_IN", "message": "未登录"})
+    limit = max(1, min(100, limit))
+    items = list_ledger(user.id, limit)
+    return {"items": items, "count": len(items)}
 
 
 # ════════════════════════════════════════════════════════════════════════

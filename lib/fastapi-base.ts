@@ -21,3 +21,22 @@ export function getFastapiBase(): string {
   if (process.env.NODE_ENV === "production") return ""
   return "http://127.0.0.1:8000"
 }
+
+export async function proxyToFastapi(req: Request, path: string): Promise<Response> {
+  const base = getFastapiBase()
+  const url = new URL(path, base.endsWith("/") ? base : base + "/").toString()
+  const headers = new Headers(req.headers)
+  headers.delete("host")
+  headers.delete("connection")
+  const init: RequestInit = {
+    method: req.method,
+    headers,
+    redirect: "manual",
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = await req.text()
+  }
+  const upstream = await fetch(url, init)
+  const respHeaders = new Headers(upstream.headers)
+  return new Response(upstream.body, { status: upstream.status, headers: respHeaders })
+}
