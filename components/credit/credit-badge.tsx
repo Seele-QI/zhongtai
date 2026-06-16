@@ -35,6 +35,8 @@ export function CreditBadge() {
       } else if (r.ok) {
         const data = (await r.json()) as Me
         setMe(data)
+      } else {
+        setMe(null)
       }
     } catch {
       setMe(null)
