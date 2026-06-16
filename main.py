@@ -14,12 +14,13 @@ from pydantic import BaseModel
 from lib.runninghub_client import RunningHubClient, RunningHubError, build_motion_prompt, build_cover_prompt
 
 from lib.auth import (
-    SESSION_COOKIE, create_session, destroy_session, get_current_user, get_or_create_user,
-    save_sms_code, verify_sms_code, mask_phone,
+    SESSION_COOKIE, consume_email_token, create_session, destroy_session,
+    get_current_user, get_or_create_user_by_hash, hash_email, mask_email,
+    save_email_token, generate_token,
 )
 from lib.credit import get_account, list_ledger
-from lib.rate_limit import check_ip, check_phone
-from lib.sms import generate_code, send as sms_send
+from lib.rate_limit import check_ip, check_email
+from lib.email import send_login_link
 
 load_dotenv()
 
@@ -89,6 +90,10 @@ class CoverGenerateRequest(BaseModel):
     task_id: str
     image_url: str = ""
     gender: str = "female"
+
+
+class CancelVideoTaskRequest(BaseModel):
+    task_id: str
 
 
 def _require_deepseek_key() -> None:
@@ -232,6 +237,7 @@ async def agent_chat(req: AgentRequest):
 
 # 内存存储任务状态（生产环境应替换为数据库）
 _task_store: dict[str, dict] = {}
+_poll_tasks: dict[str, object] = {}
 
 
 def _get_rh_client() -> "RunningHubClient":
@@ -239,7 +245,7 @@ def _get_rh_client() -> "RunningHubClient":
     if not RUNNINGHUB_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="未配置 RUNNINGHUB_API_KEY。请在 .env.local 中设置后重启服务。",
+            detail="未配置 RUNNINGHUB_API_KEY。请在项目根目录 .env 中设置后重启服务。",
         )
     return RunningHubClient(RUNNINGHUB_API_KEY)
 
@@ -325,7 +331,8 @@ async def video_generate(req: VideoGenerateRequest):
 
         # 7. 启动后台轮询
         import asyncio
-        asyncio.create_task(_poll_video_task(video_task_id))
+        poll_task = asyncio.create_task(_poll_video_task(video_task_id))
+        _poll_tasks[video_task_id] = poll_task
 
         return TaskStatusResponse(
             task_id=video_task_id,
@@ -347,6 +354,7 @@ async def video_generate(req: VideoGenerateRequest):
 
 async def _poll_video_task(task_id: str):
     """后台轮询视频生成任务，完成后自动触发封面图生成"""
+    import asyncio
     rh = _get_rh_client()
     stored = _task_store.get(task_id, {})
     try:
@@ -387,6 +395,17 @@ async def _poll_video_task(task_id: str):
                     print(f"[cover] Cover generated: {cover_url[:80]}")
             except Exception as e:
                 print(f"[cover] Cover generation failed (non-blocking): {e}")
+    except asyncio.CancelledError:
+        _task_store[task_id] = {
+            **stored,
+            "task_id": task_id,
+            "status": "failed",
+            "progress": 0,
+            "video_url": "",
+            "error": "用户已停止生成（中断任务不会返还积分）",
+            "estimated_minutes": 0,
+        }
+        return
     except RunningHubError as e:
         _task_store[task_id] = {
             **stored,
@@ -407,6 +426,34 @@ async def _poll_video_task(task_id: str):
             "error": f"轮询异常: {e}",
             "estimated_minutes": 0,
         }
+    finally:
+        _poll_tasks.pop(task_id, None)
+
+
+@app.post("/api/video/cancel")
+async def video_cancel(req: CancelVideoTaskRequest):
+    task_id = (req.task_id or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="缺少 task_id 参数")
+
+    task = _poll_tasks.pop(task_id, None)
+    if task is not None:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+
+    stored = _task_store.get(task_id, {})
+    _task_store[task_id] = {
+        **stored,
+        "task_id": task_id,
+        "status": "failed",
+        "progress": 0,
+        "video_url": "",
+        "error": "用户已停止生成（中断任务不会返还积分）",
+        "estimated_minutes": 0,
+    }
+    return {"ok": True, "task_id": task_id}
 
 
 # ── GET /api/video/status ─────────────────────────────────────
@@ -755,50 +802,68 @@ async def share_redirect(token: str):
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  积分系统：认证与积分 API
+#  积分系统：认证与积分 API（邮箱 Magic Link）
 # ════════════════════════════════════════════════════════════════════════
 
 
-class SendCodeRequest(BaseModel):
-    phone: str
+import re as _re
+
+_EMAIL_RE = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-@app.post("/api/auth/send-code")
-async def auth_send_code(req: SendCodeRequest, request: Request):
-    """发送短信验证码。永远返回 ok=True，不告诉前端是限频了还是手机号错了。"""
-    phone = (req.phone or "").strip()
-    if not phone or not phone.isdigit() or len(phone) != 11:
+def _public_base(request: Request) -> str:
+    """获取公网访问地址，用于邮件中链接拼接。"""
+    env_base = (os.getenv("APP_PUBLIC_BASE") or "").strip().rstrip("/")
+    if env_base:
+        return env_base
+    # fallback: 用 host header 推断
+    host = request.headers.get("host", "")
+    if host:
+        scheme = request.url.scheme
+        return f"{scheme}://{host}"
+    return ""
+
+
+class SendLinkRequest(BaseModel):
+    email: str
+
+
+@app.post("/api/auth/send-link")
+async def auth_send_link(req: SendLinkRequest, request: Request):
+    """发送登录链接。永远返回 ok=True，不告诉前端是限频了还是 email 错了。"""
+    email = (req.email or "").strip()
+    if not email or not _EMAIL_RE.match(email) or len(email) > 254:
         return {"ok": True}
-    from lib.auth import hash_phone
-    phone_h = hash_phone(phone)
-    ok, _ = check_phone(phone_h)
+    email_h = hash_email(email)
+    ok, _ = check_email(email_h)
     if not ok:
         return {"ok": True}
     ip = request.client.host if request.client else ""
     ok, _ = check_ip(ip)
     if not ok:
         return {"ok": True}
-    code = generate_code()
-    save_sms_code(phone, code)
-    sms_send(phone, code)
+    token = generate_token()
+    save_email_token(email, token)
+    base = _public_base(request)
+    link = f"{base}/auth/verify?token={token}"
+    send_login_link(email, link)
     return {"ok": True}
 
 
-class VerifyCodeRequest(BaseModel):
-    phone: str
-    code: str
+class VerifyTokenRequest(BaseModel):
+    token: str
 
 
-@app.post("/api/auth/verify-code")
-async def auth_verify_code(req: VerifyCodeRequest, request: Request, response: Response):
-    """验证并登录。"""
-    phone = (req.phone or "").strip()
-    code = (req.code or "").strip()
-    if not phone or not code:
-        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "手机号或验证码为空"})
-    if not verify_sms_code(phone, code):
-        raise HTTPException(status_code=401, detail={"code": "INVALID_CODE", "message": "验证码错误或已过期"})
-    user_id = get_or_create_user(phone)
+@app.post("/api/auth/verify-token")
+async def auth_verify_token(req: VerifyTokenRequest, request: Request, response: Response):
+    """验证 token 并登录。"""
+    token = (req.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "token 不能为空"})
+    info = consume_email_token(token)
+    if not info:
+        raise HTTPException(status_code=401, detail={"code": "INVALID_TOKEN", "message": "链接无效或已过期"})
+    user_id = get_or_create_user_by_hash(info["email_hash"], info["email_masked"])
     ua = request.headers.get("user-agent", "")
     ip = request.client.host if request.client else ""
     sid = create_session(user_id, ua, ip)
@@ -813,7 +878,7 @@ async def auth_verify_code(req: VerifyCodeRequest, request: Request, response: R
     )
     acct = get_account(user_id)
     return {
-        "user": {"id": user_id, "phone_masked": mask_phone(phone)},
+        "user": {"id": user_id, "email_masked": info["email_masked"]},
         "balance": acct.balance,
     }
 
@@ -836,7 +901,7 @@ async def auth_me(request: Request):
     return {
         "user": {
             "id": user.id,
-            "phone_masked": user.phone_masked,
+            "email_masked": user.email_masked,
             "nickname": user.nickname,
         },
         "balance": acct.balance,

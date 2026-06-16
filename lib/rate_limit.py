@@ -1,10 +1,10 @@
-"""手机号/IP 限频。用于 send-code 入口。"""
+"""邮箱/IP 限频。用于 send-link 入口。"""
 import time
 from typing import Tuple
 
 from lib.db import connect
 
-PHONE_LIMITS = [
+EMAIL_LIMITS = [
     (60, 1),
     (3600, 5),
     (86400, 10),
@@ -18,7 +18,7 @@ def _count_since(key: str, since_ts: int) -> int:
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT COUNT(*) FROM sms_codes WHERE phone_hash = ? AND created_at >= ?",
+            "SELECT COUNT(*) FROM email_tokens WHERE email_hash = ? AND created_at >= ?",
             (key, since_ts),
         ).fetchone()
         return int(row[0])
@@ -26,11 +26,11 @@ def _count_since(key: str, since_ts: int) -> int:
         conn.close()
 
 
-def check_phone(phone_hash: str) -> Tuple[bool, str]:
+def check_email(email_hash: str) -> Tuple[bool, str]:
     now = int(time.time() * 1000)
-    for window_s, limit in PHONE_LIMITS:
+    for window_s, limit in EMAIL_LIMITS:
         since = now - window_s * 1000
-        if _count_since(phone_hash, since) >= limit:
+        if _count_since(email_hash, since) >= limit:
             mins = window_s // 60
             return False, f"操作过于频繁，请 {mins} 分钟后再试"
     return True, ""
