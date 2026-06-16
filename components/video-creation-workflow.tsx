@@ -2,7 +2,6 @@
 
 import * as React from "react"
 import {
-  Upload,
   Image as ImageIcon,
   Mic,
   FileText,
@@ -11,28 +10,48 @@ import {
   CheckCircle2,
   Loader2,
   AlertCircle,
-  ArrowRight,
   Sparkles,
   Zap,
   Wand2,
   Scissors,
   RefreshCw,
   Download,
+  Square,
+  ChevronLeft,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { toast } from "@/hooks/use-toast"
 import { addHistoryRecord, addShareVideo } from "@/components/video-history"
-import { loadTask, saveTask, clearTask, type VideoTaskState } from "@/lib/video-task-store"
+import {
+  loadTask,
+  saveTask,
+  createNewTask,
+  calcOverallProgress,
+  estimateVoiceCloneProgress,
+  getTaskStoreErrorMessage,
+  type VideoTaskState,
+} from "@/lib/video-task-store"
+import {
+  deriveWorkflowUi,
+  getTaskHealth,
+  getTaskHealthMessage,
+  RESUME_POLL_GRACE_MS,
+  type WorkflowStepId as StepId,
+  type WorkflowStepStatus as StepStatus,
+} from "@/lib/video-task-runtime"
 import { getFastapiBase } from "@/lib/fastapi-base"
-
-/* ------------------------------------------------------------------ */
-/*  Types                                                              */
-/* ------------------------------------------------------------------ */
-
-type StepId = 1 | 2 | 3 | 4
-
-type StepStatus = "pending" | "active" | "loading" | "done" | "error"
 
 type UploadedImage = {
   file: File
@@ -212,65 +231,113 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   // Persisted task state — survives tab switch, browser refresh, browser close.
   // Initialised from localStorage on mount; updated on every change.
   const [taskState, setTaskState] = React.useState<VideoTaskState>(() => {
-    const saved = loadTask()
-    if (saved) return saved
-    const now = Date.now()
-    return {
-      taskId: "", status: "pending", progress: 0, isProcessing: false, errorMessage: "",
-      videoUrl: "", coverUrl: "", script: initialScript ?? "", gender: "female",
-      imageBase64: "", imagePreview: "", audioBase64: "", audioName: "", audioDuration: "",
-      selectedPreset: "", isEditing: false, qrDataUrl: "", shareUrl: "", copied: false,
-      createdAt: now, updatedAt: now,
+    const saved: VideoTaskState | null = loadTask()
+    if (saved) {
+      // 兼容旧版：若 progress 是单数字，升级到分段结构
+      if (typeof (saved as any).stageProgress !== "object") {
+        saved.stageProgress = { voiceClone: 0, videoGen: 0, editing: 0 }
+        saved.currentStage = "idle"
+        saved.lastHeartbeat = 0
+      }
+      return saved
     }
+    const initial = createNewTask()
+    initial.script = initialScript ?? ""
+    return initial
   })
 
-  // Persist on every change (auto-save)
-  React.useEffect(() => { saveTask(taskState) }, [taskState])
+  const [storageWarningMessage, setStorageWarningMessage] = React.useState("")
+  // 临时未持久化的状态
+  const [image, setImage] = React.useState<UploadedImage | null>(null)
+  const [audio, setAudio] = React.useState<UploadedAudio | null>(null)
+  const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollSessionRef = React.useRef(0)
+  const pollInFlightRef = React.useRef(false)
+  const skipNextHealthCheckRef = React.useRef(false)
+  const storageWarningKeyRef = React.useRef("")
+  const taskIdRef = React.useRef(taskState.taskId)
+  const coverWaitStartRef = React.useRef(0)
+  taskIdRef.current = taskState.taskId
+  const taskStateRef = React.useRef(taskState)
+  taskStateRef.current = taskState
+  const handleTaskStoreResult = React.useCallback((result: ReturnType<typeof saveTask>) => {
+    if (result.ok) {
+      storageWarningKeyRef.current = ""
+      setStorageWarningMessage("")
+      return
+    }
+
+    const message = getTaskStoreErrorMessage(result.errorKind)
+    setStorageWarningMessage(message)
+
+    if (storageWarningKeyRef.current === result.errorKind) {
+      return
+    }
+
+    storageWarningKeyRef.current = result.errorKind
+    toast({
+      title: result.errorKind === "quota-exceeded" ? "本地存储空间不足" : "本地草稿保存失败",
+      description: message,
+      variant: "destructive",
+    })
+  }, [])
 
   // Convenience setters — keep call sites short, persist transparently
   const updateTask = React.useCallback((patch: Partial<VideoTaskState>) => {
-    setTaskState((prev) => ({ ...prev, ...patch }))
-  }, [])
+    const nextState = { ...taskStateRef.current, ...patch }
+    taskStateRef.current = nextState
+    taskIdRef.current = nextState.taskId
+    setTaskState(nextState)
+    handleTaskStoreResult(saveTask(nextState))
+  }, [handleTaskStoreResult])
 
   // Legacy aliases for source-level readability
   const taskId = taskState.taskId
   const script = taskState.script
   const gender = taskState.gender
-  const progress = taskState.progress
   const videoUrl = taskState.videoUrl
   const coverUrl = taskState.coverUrl
   const isProcessing = taskState.isProcessing
   const errorMessage = taskState.errorMessage
+  const editingErrorMessage = taskState.editingErrorMessage
   const selectedPreset = taskState.selectedPreset
   const isEditing = taskState.isEditing
+  const stageProgress = taskState.stageProgress
+  const currentStage = taskState.currentStage
   const setScript = (v: string) => updateTask({ script: v })
   const setGender = (v: "male" | "female") => updateTask({ gender: v })
-  const setTaskId = (v: string) => updateTask({ taskId: v })
-  const setProgress = (v: number | ((p: number) => number)) =>
-    updateTask({ progress: typeof v === "function" ? v(taskState.progress) : v })
   const setVideoUrl = (v: string) => updateTask({ videoUrl: v })
-  const setCoverUrl = (v: string) => updateTask({ coverUrl: v })
-  const setIsProcessing = (v: boolean) => updateTask({ isProcessing: v })
-  const setErrorMessage = (v: string) => updateTask({ errorMessage: v })
-  const setSelectedPreset = (v: string | null) => updateTask({ selectedPreset: v || "" })
+  const setSelectedPreset = (v: string | null) => updateTask({ selectedPreset: v || "", editingErrorMessage: "" })
   const setIsEditing = (v: boolean) => updateTask({ isEditing: v })
 
-  // 临时未持久化的状态
-  const [image, setImage] = React.useState<UploadedImage | null>(null)
-  const [audio, setAudio] = React.useState<UploadedAudio | null>(null)
-  const [activeStep, setActiveStep] = React.useState<StepId>(1)
-  const [stepStatuses, setStepStatuses] = React.useState<Record<StepId, StepStatus>>({
-    1: "active", 2: "pending", 3: "pending", 4: "pending",
-  })
-  const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
-  const taskIdRef = React.useRef(taskState.taskId)
-  taskIdRef.current = taskState.taskId
   const scriptRef = React.useRef(taskState.script)
   scriptRef.current = script
   const genderRef = React.useRef(gender)
   genderRef.current = gender
-  const coverUrlRef = React.useRef(coverUrl)
-  coverUrlRef.current = coverUrl
+  const workflowUi = React.useMemo(() => deriveWorkflowUi(taskState), [taskState])
+  const activeStep = workflowUi.activeStep
+  const stepStatuses = workflowUi.stepStatuses
+  const readableTaskErrorMessage = errorMessage || getTaskHealthMessage(taskState)
+  const submittedAtLabel = taskState.submittedAt
+    ? new Date(taskState.submittedAt).toLocaleString("zh-CN", { hour12: false })
+    : ""
+  const lastStatusAtLabel = taskState.lastStatusAt
+    ? new Date(taskState.lastStatusAt).toLocaleString("zh-CN", { hour12: false })
+    : "暂未同步到任务状态"
+  const imagePreviewSrc = image?.previewUrl || taskState.imagePreview
+  const imageBase64 = image?.base64 || taskState.imageBase64
+  const audioBase64 = audio?.base64 || taskState.audioBase64
+  const audioName = audio?.name || taskState.audioName
+  const audioDuration = audio?.duration || taskState.audioDuration
+  const hasImage = !!(imagePreviewSrc && imageBase64)
+  const hasAudio = !!audioBase64
+  const localPreviewImageSrc = imagePreviewSrc
+  const isLocalPreviewMode =
+    !videoUrl &&
+    !!localPreviewImageSrc &&
+    currentStage === "done" &&
+    !taskState.taskId &&
+    !taskState.isProcessing
 
   // Reset script when initialScript changes (from cross-navigation)
   React.useEffect(() => {
@@ -283,7 +350,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
   }, [image?.previewUrl])
 
-  const canGenerate = !!(image && audio && script.trim())
+  const canGenerate = !!(hasImage && hasAudio && script.trim())
 
   const handleImageFile = React.useCallback(async (file: File) => {
     if (file.size > MAX_FILE_SIZE) {
@@ -294,10 +361,14 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       const base64 = await fileToBase64(file)
       const previewUrl = URL.createObjectURL(file)
       setImage({ file, previewUrl, base64 })
+      updateTask({
+        imageBase64: base64,
+        imagePreview: `data:${file.type || "image/png"};base64,${base64}`,
+      })
     } catch {
       toast({ title: "读取失败", description: "无法读取图片文件", variant: "destructive" })
     }
-  }, [])
+  }, [updateTask])
 
   const handleAudioFile = React.useCallback(async (file: File) => {
     if (file.size > MAX_FILE_SIZE) {
@@ -309,82 +380,279 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       // Mock duration — in real implementation, read actual duration
       const duration = "0:32"
       setAudio({ file, name: file.name, duration, base64 })
+      updateTask({
+        audioBase64: base64,
+        audioName: file.name,
+        audioDuration: duration,
+      })
     } catch {
       toast({ title: "读取失败", description: "无法读取音频文件", variant: "destructive" })
     }
+  }, [updateTask])
+
+  const stopBackgroundPoll = React.useCallback(() => {
+    pollSessionRef.current += 1
+    pollInFlightRef.current = false
+    if (pollRef.current) {
+      clearTimeout(pollRef.current)
+      pollRef.current = null
+    }
   }, [])
+
+  const failTask = React.useCallback((message: string, options?: { taskId?: string; recordHistory?: boolean }) => {
+    stopBackgroundPoll()
+    const failedTaskId = options?.taskId ?? taskIdRef.current
+    updateTask({
+      status: "failed",
+      currentStage: "failed",
+      isProcessing: false,
+      errorMessage: message,
+      editingErrorMessage: "",
+      resumeGraceUntil: 0,
+    })
+    if (options?.recordHistory && failedTaskId) {
+      addHistoryRecord({
+        id: failedTaskId,
+        createdAt: Date.now(),
+        script: scriptRef.current.trim(),
+        videoUrl: "",
+        coverUrl: "",
+        gender: genderRef.current,
+        status: "failed",
+        errorMessage: message,
+      })
+    }
+  }, [stopBackgroundPoll, updateTask])
+
+  const handleStopGeneration = React.useCallback(async () => {
+    const snapshot = taskStateRef.current
+    if (!snapshot.isProcessing) return
+
+    const taskIdToCancel = snapshot.taskId
+    const base = getFastapiBase()
+    if (base && taskIdToCancel) {
+      try {
+        await fetch(`${base}/api/video/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task_id: taskIdToCancel }),
+        })
+      } catch {
+      }
+    }
+
+    const message = "已停止生成（中断任务不会返还积分）"
+    if (taskIdToCancel) {
+      failTask(message, { taskId: taskIdToCancel, recordHistory: true })
+    } else {
+      failTask(message)
+    }
+    toast({ title: "已停止生成", description: "中断任务不会返还积分。", variant: "destructive" })
+  }, [failTask])
 
   /** Background poll — survives component re-render (when user switches sidebar tabs) */
   const startBackgroundPoll = React.useCallback((tid: string) => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    pollRef.current = setInterval(async () => {
+    stopBackgroundPoll()
+    const sessionId = pollSessionRef.current
+
+    const pollOnce = async () => {
+      if (pollInFlightRef.current || pollSessionRef.current !== sessionId || taskIdRef.current !== tid) {
+        return
+      }
+
+      pollInFlightRef.current = true
+      let shouldScheduleNext = true
       const base = getFastapiBase()
-      if (!base) return
-      try {
-        const sr = await fetch(`${base}/api/video/status?taskId=${tid}`)
-        const sd = await sr.json()
-        if (!sr.ok) return
-        const s = sd.status?.toLowerCase()
-        if (s === "success") {
-          clearInterval(pollRef.current!)
-          pollRef.current = null
-          const vUrl = sd.video_url || sd.videoUrl || ""
-          const cUrl = sd.cover_url || sd.coverUrl || ""
-          setVideoUrl(vUrl)
-          if (cUrl) setCoverUrl(cUrl)
-          setProgress(100)
-          setStepStatuses((prev) => ({ ...prev, 3: "done", 4: "active" }))
-          setActiveStep(4)
-          setIsProcessing(false)
-          addHistoryRecord({
-            id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
-            videoUrl: vUrl, coverUrl: cUrl, gender: genderRef.current, status: "success",
-          })
-          if (vUrl) {
-            addShareVideo({
-              id: tid, title: scriptRef.current.trim().slice(0, 30),
-              url: vUrl, thumbnail: cUrl || undefined, source: "video-creation", createdAt: Date.now(),
+      if (!base) {
+        shouldScheduleNext = false
+        failTask("缺少后端配置，无法继续同步任务状态。", { taskId: tid, recordHistory: true })
+      } else {
+        try {
+          const sr = await fetch(`${base}/api/video/status?taskId=${encodeURIComponent(tid)}`)
+          const sd = await sr.json()
+          if (pollSessionRef.current !== sessionId || taskIdRef.current !== tid) {
+            shouldScheduleNext = false
+            return
+          }
+          if (!sr.ok) {
+            const pollError =
+              typeof sd?.detail === "string"
+                ? sd.detail
+                : typeof sd?.error === "string"
+                  ? sd.error
+                  : "查询任务状态失败"
+            const prev = taskStateRef.current
+            updateTask({
+              pollErrorCount: prev.pollErrorCount + 1,
+              lastPollError: pollError,
+            })
+            return
+          }
+
+          const now = Date.now()
+          updateTask({ lastStatusAt: now, resumeGraceUntil: 0, pollErrorCount: 0, lastPollError: "" })
+          const s = sd.status?.toLowerCase()
+          if (s === "success") {
+            const vUrl = sd.video_url || sd.videoUrl || ""
+            const cUrl = sd.cover_url || sd.coverUrl || ""
+            const nextStageProgress = { voiceClone: 100, videoGen: 100, editing: 0 }
+
+            // 视频已就绪但封面图尚未生成 — 继续轻量轮询等待封面（间隔 10s，最多额外等 120s）
+            if (vUrl && !cUrl) {
+              if (coverWaitStartRef.current === 0) {
+                coverWaitStartRef.current = Date.now()
+              }
+              const coverElapsed = Date.now() - coverWaitStartRef.current
+              if (coverElapsed > 120_000) {
+                // 封面超时 — 保留视频，停止轮询，不做失败态
+                coverWaitStartRef.current = 0
+                shouldScheduleNext = false
+                stopBackgroundPoll()
+                updateTask({
+                  status: "success",
+                  currentStage: "done",
+                  isProcessing: false,
+                  errorMessage: "",
+                  editingErrorMessage: "",
+                  videoUrl: vUrl,
+                  coverUrl: "",
+                  progress: 100,
+                  stageProgress: nextStageProgress,
+                  lastStatusAt: now,
+                })
+                addHistoryRecord({
+                  id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
+                  videoUrl: vUrl, coverUrl: "", gender: genderRef.current, status: "success",
+                })
+                if (vUrl) {
+                  addShareVideo({
+                    id: tid, title: scriptRef.current.trim().slice(0, 30),
+                    url: vUrl, thumbnail: undefined, source: "video-creation", createdAt: Date.now(),
+                  })
+                }
+              } else {
+                // 更新 videoUrl 让用户可见，但继续轮询封面
+                updateTask({
+                  status: "polling",
+                  currentStage: "video",
+                  isProcessing: true,
+                  errorMessage: "",
+                  editingErrorMessage: "",
+                  videoUrl: vUrl,
+                  coverUrl: "",
+                  progress: 100,
+                  stageProgress: nextStageProgress,
+                  lastStatusAt: now,
+                })
+              }
+            } else {
+              // 封面已就绪或无视频 — 正常完成
+              coverWaitStartRef.current = 0
+              shouldScheduleNext = false
+              stopBackgroundPoll()
+              updateTask({
+                status: "success",
+                currentStage: "done",
+                isProcessing: false,
+                errorMessage: "",
+                editingErrorMessage: "",
+                videoUrl: vUrl,
+                coverUrl: cUrl,
+                progress: 100,
+                stageProgress: nextStageProgress,
+                lastStatusAt: now,
+              })
+              addHistoryRecord({
+                id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
+                videoUrl: vUrl, coverUrl: cUrl, gender: genderRef.current, status: "success",
+              })
+              if (vUrl) {
+                addShareVideo({
+                  id: tid, title: scriptRef.current.trim().slice(0, 30),
+                  url: vUrl, thumbnail: cUrl || undefined, source: "video-creation", createdAt: Date.now(),
+                })
+              }
+            }
+          } else if (s === "failed") {
+            shouldScheduleNext = false
+            const errMsg = sd.error || sd.detail || "生成失败"
+            failTask(errMsg, { taskId: tid, recordHistory: true })
+          } else {
+            const prev = taskStateRef.current
+            const nextStageProgress = {
+              voiceClone: Math.max(prev.stageProgress.voiceClone, 100),
+              videoGen: typeof sd.progress === "number" ? Math.max(prev.stageProgress.videoGen, sd.progress) : prev.stageProgress.videoGen,
+              editing: 0,
+            }
+            updateTask({
+              status: "polling",
+              currentStage: "video",
+              lastHeartbeat: now,
+              lastStatusAt: now,
+              progress: calcOverallProgress(nextStageProgress),
+              stageProgress: nextStageProgress,
             })
           }
-        } else if (s === "failed") {
-          clearInterval(pollRef.current!)
-          pollRef.current = null
-          const errMsg = sd.error || sd.detail || "生成失败"
-          setErrorMessage(errMsg)
-          setStepStatuses((prev) => ({ ...prev, 3: "error" }))
-          setIsProcessing(false)
-          addHistoryRecord({
-            id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
-            videoUrl: "", coverUrl: "", gender: genderRef.current, status: "failed", errorMessage: errMsg,
+        } catch (error) {
+          if (pollSessionRef.current !== sessionId || taskIdRef.current !== tid) {
+            shouldScheduleNext = false
+            return
+          }
+          const prev = taskStateRef.current
+          updateTask({
+            pollErrorCount: prev.pollErrorCount + 1,
+            lastPollError: error instanceof Error ? error.message : "轮询任务状态失败",
           })
-        } else if (typeof sd.progress === "number") {
-          setProgress((p) => Math.max(p, sd.progress))
+        } finally {
+          pollInFlightRef.current = false
+          if (shouldScheduleNext && pollSessionRef.current === sessionId && taskIdRef.current === tid) {
+            const pollInterval = coverWaitStartRef.current !== 0 ? 10000 : 5000
+            pollRef.current = setTimeout(() => {
+              void pollOnce()
+            }, pollInterval)
+          }
         }
-      } catch { /* ignore polling errors */ }
-    }, 5000)
-  }, [])
+      }
+    }
+
+    void pollOnce()
+  }, [failTask, stopBackgroundPoll, updateTask])
 
   const handleGenerate = React.useCallback(async () => {
     if (!canGenerate || isProcessing) return
+    if (!imageBase64 || !audioBase64) return
     const base = getFastapiBase()
     if (!base) {
       toast({ title: "缺少后端配置", description: "请配置 NEXT_PUBLIC_FASTAPI_URL", variant: "destructive" })
       return
     }
-    setIsProcessing(true)
-    setErrorMessage("")
-    setVideoUrl("")
-
-    setActiveStep(2)
-    setStepStatuses((prev) => ({ ...prev, 1: "done", 2: "loading" }))
+    const submittedAt = Date.now()
+    updateTask({
+      status: "scanning",
+      currentStage: "voice",
+      lastHeartbeat: submittedAt,
+      submittedAt,
+      lastStatusAt: 0,
+      resumeGraceUntil: 0,
+      pollErrorCount: 0,
+      lastPollError: "",
+      taskId: "",
+      isProcessing: true,
+      errorMessage: "",
+      editingErrorMessage: "",
+      videoUrl: "",
+      coverUrl: "",
+      progress: 0,
+      stageProgress: { voiceClone: 0, videoGen: 0, editing: 0 },
+    })
 
     try {
       const res = await fetch(`${base}/api/video/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          image_base64: image!.base64,
-          audio_base64: audio!.base64,
+          image_base64: imageBase64,
+          audio_base64: audioBase64,
           script: script.trim(),
           gender,
         }),
@@ -395,34 +663,194 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
       const tid = data.task_id || data.taskId
       if (!tid) throw new Error("未返回 taskId")
-      setTaskId(tid)
-
-      setStepStatuses((prev) => ({ ...prev, 2: "done", 3: "loading" }))
-      setActiveStep(3)
+      const nextStageProgress = { voiceClone: 100, videoGen: 0, editing: 0 }
+      updateTask({
+        taskId: tid,
+        status: "polling",
+        currentStage: "video",
+        lastHeartbeat: Date.now(),
+        videoStageStartedAt: Date.now(),
+        progress: calcOverallProgress(nextStageProgress),
+        stageProgress: nextStageProgress,
+      })
 
       // Start background poll using refs — survives re-render when navigating away
       startBackgroundPoll(tid)
     } catch (e) {
-      setErrorMessage(e instanceof Error ? e.message : "生成过程出错，请重新点击生成")
-      setStepStatuses((prev) => ({ ...prev, 3: "error" }))
-      setIsProcessing(false)
+      failTask(e instanceof Error ? e.message : "生成过程出错，请重新点击生成")
     }
-  }, [canGenerate, isProcessing, image, audio, script, gender])
+  }, [audioBase64, canGenerate, failTask, gender, imageBase64, isProcessing, script, startBackgroundPoll, updateTask])
 
   React.useEffect(() => {
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [])
+    return () => { stopBackgroundPoll() }
+  }, [stopBackgroundPoll])
+
+  // 重新挂载时恢复轮询（切页回来时 taskId 还在但 pollRef 已失）
+  React.useEffect(() => {
+    if (taskId && workflowUi.shouldResumePolling && !pollRef.current) {
+      const now = Date.now()
+      skipNextHealthCheckRef.current = true
+      if (taskState.resumeGraceUntil < now) {
+        updateTask({ resumeGraceUntil: now + RESUME_POLL_GRACE_MS })
+      }
+      startBackgroundPoll(taskId)
+    }
+    if (!workflowUi.shouldResumePolling) {
+      skipNextHealthCheckRef.current = false
+      stopBackgroundPoll()
+    }
+  }, [startBackgroundPoll, stopBackgroundPoll, taskId, taskState.resumeGraceUntil, updateTask, workflowUi.shouldResumePolling])
+
+  React.useEffect(() => {
+    if (!taskState.isProcessing) return
+    const checkHealth = () => {
+      if (skipNextHealthCheckRef.current) {
+        skipNextHealthCheckRef.current = false
+        return
+      }
+      const snapshot = taskStateRef.current
+      const health = getTaskHealth(snapshot)
+      if (!health.shouldFail) return
+      const message = getTaskHealthMessage(snapshot) || "任务状态异常，已停止自动轮询。"
+      failTask(message, { recordHistory: true })
+      toast({ title: "任务状态异常", description: message, variant: "destructive" })
+    }
+    checkHealth()
+    const id = window.setInterval(checkHealth, 5000)
+    return () => window.clearInterval(id)
+  }, [failTask, taskState.isProcessing])
+
+  // 心跳计时器 — 当用户在 voice 阶段时，按时间估算音色克隆进度
+  // 切走页面或刷新后，lastHeartbeat 已经在 localStorage 保留，估算可恢复
+  React.useEffect(() => {
+    if (currentStage !== "voice") return
+    if (!taskState.lastHeartbeat) return  // 0 心跳 = 异常状态，不估算
+    const tick = () => {
+      const stageElapsed = Math.floor((Date.now() - taskState.lastHeartbeat) / 1000)
+      const est = estimateVoiceCloneProgress(stageElapsed)
+      const prev = loadTask()
+      if (!prev) return
+      if (prev.stageProgress.voiceClone >= 100) return
+      if (est <= prev.stageProgress.voiceClone) return
+      updateTask({
+        stageProgress: { voiceClone: est, videoGen: prev.stageProgress.videoGen, editing: prev.stageProgress.editing },
+        progress: calcOverallProgress({ voiceClone: est, videoGen: prev.stageProgress.videoGen, editing: prev.stageProgress.editing }),
+      })
+    }
+    const id = window.setInterval(tick, 1000)
+    return () => window.clearInterval(id)
+  }, [currentStage, taskState.lastHeartbeat])
+
+  // 自动编辑进度 — 从 currentStage="editing" 开始后，3 秒匀速推到 100%
+  React.useEffect(() => {
+    if (currentStage !== "editing") return
+    const startedAt = Date.now()
+    const tick = () => {
+      const elapsed = (Date.now() - startedAt) / 1000
+      const p = Math.min(100, Math.round((elapsed / 30) * 100))
+      const prev = loadTask()
+      if (!prev) return
+      if (prev.stageProgress.editing >= 100) return
+      updateTask({
+        stageProgress: { voiceClone: prev.stageProgress.voiceClone, videoGen: prev.stageProgress.videoGen, editing: p },
+        progress: calcOverallProgress({ voiceClone: prev.stageProgress.voiceClone, videoGen: prev.stageProgress.videoGen, editing: p }),
+      })
+    }
+    const id = window.setInterval(tick, 500)
+    return () => window.clearInterval(id)
+  }, [currentStage])
+
+  const handleApplyEditing = React.useCallback(async () => {
+    if (!selectedPreset || isEditing) return
+    if (isLocalPreviewMode) {
+      toast({
+        title: "本地预览模式不支持后端剪辑",
+        description: "请先完成真实视频生成，再提交剪辑任务。",
+        variant: "destructive",
+      })
+      return
+    }
+
+    const resetEditingProgress = { ...taskStateRef.current.stageProgress, editing: 0 }
+    setIsEditing(true)
+    updateTask({
+      currentStage: "editing",
+      status: "success",
+      errorMessage: "",
+      editingErrorMessage: "",
+      lastHeartbeat: Date.now(),
+      stageProgress: resetEditingProgress,
+      progress: calcOverallProgress(resetEditingProgress),
+    })
+
+    const handleEditingFailure = (message: string, title = "剪辑失败") => {
+      updateTask({
+        currentStage: "done",
+        status: "success",
+        errorMessage: "",
+        editingErrorMessage: message,
+        stageProgress: resetEditingProgress,
+        progress: calcOverallProgress(resetEditingProgress),
+      })
+      toast({ title, description: message, variant: "destructive" })
+    }
+
+    try {
+      const res = await fetch("/api/video/edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoUrl,
+          preset: selectedPreset,
+          subtitleText: script.trim(),
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        handleEditingFailure(typeof data.detail === "string" ? data.detail : "剪辑失败，请重试")
+      } else if (data.editedVideoUrl) {
+        const completedStageProgress = { ...taskStateRef.current.stageProgress, editing: 100 }
+        setVideoUrl(data.editedVideoUrl)
+        updateTask({
+          currentStage: "done",
+          status: "success",
+          errorMessage: "",
+          editingErrorMessage: "",
+          progress: 100,
+          stageProgress: completedStageProgress,
+        })
+        toast({ title: "剪辑完成", description: "视频已应用所选效果，可切换预设再次剪辑" })
+      } else {
+        handleEditingFailure("剪辑服务未返回输出视频")
+      }
+    } catch {
+      handleEditingFailure("剪辑请求失败，请检查服务是否启动", "网络错误")
+    } finally {
+      setIsEditing(false)
+    }
+  }, [isEditing, isLocalPreviewMode, script, selectedPreset, setIsEditing, setVideoUrl, updateTask, videoUrl])
 
   const handleRetry = React.useCallback(() => {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
-    setActiveStep(1)
-    setStepStatuses({ 1: "active", 2: "pending", 3: "pending", 4: "pending" })
-    setErrorMessage("")
-    setProgress(0)
-    setTaskId("")
-    setVideoUrl("")
-    setIsProcessing(false)
-  }, [])
+    stopBackgroundPoll()
+    updateTask({
+      taskId: "",
+      status: "pending",
+      progress: 0,
+      stageProgress: { voiceClone: 0, videoGen: 0, editing: 0 },
+      currentStage: "idle",
+      lastHeartbeat: 0,
+      isProcessing: false,
+      errorMessage: "",
+      editingErrorMessage: "",
+      videoUrl: "",
+      coverUrl: "",
+      submittedAt: 0,
+      lastStatusAt: 0,
+      resumeGraceUntil: 0,
+      pollErrorCount: 0,
+      lastPollError: "",
+    })
+  }, [stopBackgroundPoll, updateTask])
 
   const steps = [
     { id: 1 as StepId, label: "素材准备", status: stepStatuses[1] },
@@ -461,6 +889,22 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           )}
         </div>
 
+        {storageWarningMessage && (
+          <div className="mb-6 rounded-2xl border border-amber-200/60 bg-amber-50/70 p-4 dark:border-amber-500/20 dark:bg-amber-500/5">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div>
+                <p className="text-[14px] font-medium text-amber-800 dark:text-amber-300">
+                  当前素材未完整保存到本地
+                </p>
+                <p className="mt-1 text-[12px] leading-relaxed text-amber-700 dark:text-amber-400">
+                  {storageWarningMessage}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ================================================================ */}
         {/*  Step 1: Material Upload                                          */}
         {/* ================================================================ */}
@@ -474,10 +918,10 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
               {/* Image Upload */}
               <div>
-                {image ? (
+                {hasImage ? (
                   <div className="relative overflow-hidden rounded-2xl border border-slate-200/60 bg-white dark:border-white/10 dark:bg-white/5">
                     <img
-                      src={image.previewUrl}
+                      src={imagePreviewSrc}
                       alt="数字人形象"
                       className="aspect-square w-full object-cover"
                     />
@@ -485,7 +929,10 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       <span className="text-[11px] text-white">形象照片</span>
                       <button
                         type="button"
-                        onClick={() => setImage(null)}
+                        onClick={() => {
+                          setImage(null)
+                          updateTask({ imageBase64: "", imagePreview: "" })
+                        }}
                         className="rounded-lg bg-white/20 px-2 py-0.5 text-[11px] text-white backdrop-blur hover:bg-white/30"
                       >
                         更换
@@ -505,7 +952,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
               {/* Audio Upload */}
               <div>
-                {audio ? (
+                {hasAudio ? (
                   <div className="flex flex-col gap-3 rounded-2xl border border-slate-200/60 bg-white p-5 dark:border-white/10 dark:bg-white/5">
                     <div className="flex items-center gap-3">
                       <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-50 dark:bg-rose-500/10">
@@ -513,16 +960,23 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       </span>
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-[13px] font-medium text-slate-700 dark:text-slate-300">
-                          {audio.name}
+                          {audioName || "已上传参考音色"}
                         </p>
                         <p className="text-[11px] text-slate-400">
-                          {formatSize(audio.file.size)} · {audio.duration}
+                          {audio?.file
+                            ? `${formatSize(audio.file.size)} · ${audioDuration || "时长未知"}`
+                            : audioDuration
+                              ? `时长 ${audioDuration}`
+                              : "已恢复已上传音频"}
                         </p>
                       </div>
                     </div>
                     <button
                       type="button"
-                      onClick={() => setAudio(null)}
+                      onClick={() => {
+                        setAudio(null)
+                        updateTask({ audioBase64: "", audioName: "", audioDuration: "" })
+                      }}
                       className="self-end rounded-lg bg-slate-100 px-3 py-1 text-[11px] text-slate-500 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10"
                     >
                       更换
@@ -619,17 +1073,57 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   </>
                 )}
               </Button>
+              {isProcessing && (
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button variant="destructive" size="sm" className="rounded-xl">
+                      <Square className="h-4 w-4" />
+                      停止生成
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>停止生成？</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        将立即中断本次任务跟踪，已消耗积分不返还。
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>继续生成</AlertDialogCancel>
+                      <AlertDialogAction asChild>
+                        <Button variant="destructive" onClick={() => void handleStopGeneration()}>
+                          停止生成
+                        </Button>
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              )}
               {/* 仅剪辑模式：跳过远程生成，使用本地图片/音频直接进入 Step 4 */}
               {canGenerate && !isProcessing && (
                 <button
                   type="button"
                   onClick={() => {
-                    if (!image) return
-                    setVideoUrl(image.previewUrl)
-                    setStepStatuses({ 1: "done", 2: "done", 3: "done", 4: "active" })
-                    setActiveStep(4)
-                    setProgress(100)
-                    toast({ title: "进入剪辑模式", description: "已使用本地图片作为视频源，跳过远程生成" })
+                    updateTask({
+                      status: "success",
+                      currentStage: "done",
+                      taskId: "",
+                      isProcessing: false,
+                      isEditing: false,
+                      errorMessage: "",
+                      editingErrorMessage: "",
+                      progress: 100,
+                      videoUrl: "",
+                      coverUrl: "",
+                      resumeGraceUntil: 0,
+                      pollErrorCount: 0,
+                      lastPollError: "",
+                      stageProgress: { voiceClone: 100, videoGen: 100, editing: 0 },
+                    })
+                    toast({
+                      title: "进入本地预览模式",
+                      description: "仅用于前端预览，不会把图片地址作为视频源提交后端剪辑。",
+                    })
                   }}
                   className="rounded-xl px-4 py-2 text-[12px] font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-slate-300"
                 >
@@ -676,6 +1170,28 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       ? "音色克隆完成，已生成专属 TTS 音色"
                       : "等待上一步完成"}
                 </p>
+
+                {/* Voice Clone Progress Bar */}
+                {stepStatuses[2] === "loading" && (
+                  <div className="mt-2 space-y-1">
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
+                      <div
+                        className="h-full rounded-full bg-gradient-to-r from-rose-500 to-pink-500 transition-all duration-500"
+                        style={{ width: `${stageProgress.voiceClone}%` }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <p className="text-[11px] text-slate-400">{stageProgress.voiceClone}%</p>
+                      <button
+                        type="button"
+                        onClick={handleRetry}
+                        className="text-[11px] text-slate-400 underline-offset-2 transition-colors hover:text-slate-600 hover:underline"
+                      >
+                        任务无响应？重新开始
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -714,44 +1230,57 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       : stepStatuses[3] === "done"
                         ? "视频生成完成！"
                         : stepStatuses[3] === "error"
-                          ? "生成失败，请检查素材后重新生成"
+                          ? "任务已停止，请根据下方提示处理后重新生成"
                           : "等待上一步完成"}
                   </p>
 
-                  {/* Progress Bar */}
+                  {(stepStatuses[3] === "loading" || stepStatuses[3] === "error") && (
+                    <div className="mt-2 space-y-1 text-[11px] text-slate-400">
+                      {submittedAtLabel && <p>提交时间：{submittedAtLabel}</p>}
+                      <p>最近状态同步：{lastStatusAtLabel}</p>
+                      {taskState.pollErrorCount > 0 && <p>轮询异常：{taskState.pollErrorCount} 次</p>}
+                    </div>
+                  )}
+
+                  {/* Progress Bar — videoGen */}
                   {stepStatuses[3] === "loading" && (
                     <div className="mt-3 space-y-1.5">
                       <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
                         <div
                           className="h-full rounded-full bg-gradient-to-r from-rose-500 to-pink-500 transition-all duration-500"
-                          style={{ width: `${progress}%` }}
+                          style={{ width: `${stageProgress.videoGen}%` }}
                         />
                       </div>
-                      <p className="text-[11px] text-slate-400">{progress}%</p>
+                      <p className="text-[11px] text-slate-400">{stageProgress.videoGen}%</p>
                     </div>
                   )}
 
                   {/* Error + Retry */}
-                  {(stepStatuses[3] === "error" || errorMessage) && (
+                  {(stepStatuses[3] === "error" || readableTaskErrorMessage) && (
                     <div className="mt-3 rounded-xl border border-amber-200/60 bg-amber-50/50 p-3 dark:border-amber-500/20 dark:bg-amber-500/5">
                       <div className="flex items-start gap-2">
                         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
                         <div>
                           <p className="text-[13px] font-medium text-amber-800 dark:text-amber-300">
-                            生成失败
+                            任务处理异常
                           </p>
                           <p className="text-[12px] text-amber-700 dark:text-amber-400">
-                            {errorMessage || "服务端返回错误，请重新点击生成按钮。"}
+                            {readableTaskErrorMessage || "服务端返回错误，请重新点击生成按钮。"}
                           </p>
+                          {taskState.lastPollError && (
+                            <p className="mt-1 text-[12px] text-amber-700/90 dark:text-amber-400/90">
+                              最近一次轮询异常：{taskState.lastPollError}
+                            </p>
+                          )}
                         </div>
                       </div>
                       <button
                         type="button"
                         onClick={handleRetry}
-                        className="mt-2 inline-flex items-center gap-1 rounded-lg bg-amber-100 px-3 py-1.5 text-[12px] font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20"
+                        className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-rose-500 px-4 py-2 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-rose-600"
                       >
-                        <RefreshCw className="h-3.5 w-3.5" />
-                        重新生成
+                        <RefreshCw className="h-4 w-4" />
+                        重新开始任务
                       </button>
                     </div>
                   )}
@@ -769,6 +1298,14 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
             <div className="flex items-center gap-2">
               <span className="flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-[11px] font-bold text-rose-600 dark:bg-rose-500/20 dark:text-rose-400">4</span>
               <h2 className="text-[16px] font-semibold text-slate-800 dark:text-slate-200">预览与剪辑</h2>
+              <button
+                type="button"
+                onClick={handleRetry}
+                className="ml-auto inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-slate-300"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                回到素材准备
+              </button>
             </div>
 
             {/* Video Player */}
@@ -779,15 +1316,29 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   controls
                   className="w-full"
                   style={{ maxHeight: "480px" }}
-                  poster={image?.previewUrl}
+                  poster={localPreviewImageSrc}
                 >
                   您的浏览器不支持视频播放
                 </video>
               </div>
             )}
 
+            {isLocalPreviewMode && (
+              <div className="overflow-hidden rounded-2xl border border-slate-200/60 bg-white dark:border-white/10 dark:bg-white/5">
+                <img
+                  src={localPreviewImageSrc}
+                  alt="本地剪辑测试预览"
+                  className="w-full object-cover"
+                  style={{ maxHeight: "480px" }}
+                />
+                <div className="border-t border-slate-100 px-4 py-3 text-[12px] text-slate-500 dark:border-white/5 dark:text-slate-400">
+                  当前为本地预览模式，仅用于验证界面与预设选择，不会请求后端剪辑。
+                </div>
+              </div>
+            )}
+
             {/* No video URL yet */}
-            {!videoUrl && (
+            {!videoUrl && !isLocalPreviewMode && (
               <div className="flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-slate-200 py-12 dark:border-white/10">
                 <Clapperboard className="h-10 w-10 text-slate-300 dark:text-slate-600" />
                 <p className="text-[14px] text-slate-400">视频正在生成中，完成后将在此预览</p>
@@ -871,35 +1422,10 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
             {/* Apply Button */}
             {selectedPreset && (
-              <div className="flex justify-center border-t border-slate-100 pt-5 dark:border-white/5">
+              <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-5 dark:border-white/5">
                 <Button
-                  onClick={async () => {
-                    if (!selectedPreset || isEditing) return
-                    setIsEditing(true)
-                    try {
-                      const res = await fetch("/api/video/edit", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          videoUrl,
-                          preset: selectedPreset,
-                          subtitleText: script.trim(),
-                        }),
-                      })
-                      const data = await res.json()
-                      if (!res.ok) {
-                        toast({ title: "剪辑失败", description: data.detail || "请重试", variant: "destructive" })
-                      } else if (data.editedVideoUrl) {
-                        setVideoUrl(data.editedVideoUrl)
-                        toast({ title: "剪辑完成", description: "视频已应用所选效果，可切换预设再次剪辑" })
-                      }
-                    } catch {
-                      toast({ title: "网络错误", description: "剪辑请求失败，请检查服务是否启动", variant: "destructive" })
-                    } finally {
-                      setIsEditing(false)
-                    }
-                  }}
-                  disabled={isEditing}
+                  onClick={() => { void handleApplyEditing() }}
+                  disabled={isEditing || isLocalPreviewMode}
                   className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-rose-500 to-pink-500 px-8 py-3.5 text-[15px] font-bold text-white shadow-lg shadow-rose-500/25 transition-all hover:from-rose-600 hover:to-pink-600 active:scale-[0.97] disabled:opacity-60"
                 >
                   {isEditing ? (
@@ -914,6 +1440,48 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                     </>
                   )}
                 </Button>
+                {isLocalPreviewMode && (
+                  <p className="text-center text-[12px] text-slate-500 dark:text-slate-400">
+                    当前为本地预览模式，可测试预设选择，但不会发起后端剪辑。
+                  </p>
+                )}
+                {!isLocalPreviewMode && editingErrorMessage && !isEditing && (
+                  <div className="w-full max-w-xl rounded-xl border border-amber-200/60 bg-amber-50/60 p-3 dark:border-amber-500/20 dark:bg-amber-500/5">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[13px] font-medium text-amber-800 dark:text-amber-300">
+                          剪辑失败
+                        </p>
+                        <p className="text-[12px] text-amber-700 dark:text-amber-400">
+                          {editingErrorMessage}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { void handleApplyEditing() }}
+                      className="mt-2 inline-flex items-center gap-1 rounded-lg bg-amber-100 px-3 py-1.5 text-[12px] font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      重试剪辑
+                    </button>
+                  </div>
+                )}
+                {/* 剪辑进度条 — isEditing 时按钮变进度条 */}
+                {isEditing && currentStage === "editing" ? (
+                  <div className="flex w-full max-w-sm flex-col items-center gap-2">
+                    <div className="h-3 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
+                      <div
+                        className="h-full rounded-full bg-gradient-to-r from-violet-500 to-purple-500 transition-all duration-300"
+                        style={{ width: `${stageProgress.editing}%` }}
+                      />
+                    </div>
+                    <p className="text-center text-[12px] font-medium text-slate-500">
+                      剪辑中 {stageProgress.editing}%
+                    </p>
+                  </div>
+                ) : null}
               </div>
             )}
           </section>
@@ -928,10 +1496,12 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
               <div>
                 <p className="text-[14px] font-semibold text-emerald-800 dark:text-emerald-300">
-                  视频生成成功！
+                  {isLocalPreviewMode ? "已进入本地预览模式" : "视频生成成功！"}
                 </p>
                 <p className="text-[13px] text-emerald-700 dark:text-emerald-400">
-                  请选择上方预设剪辑效果，AI 将自动完成后期制作。
+                  {isLocalPreviewMode
+                    ? "当前仅验证界面与预设流程，不会提交后端剪辑任务。"
+                    : "请选择上方预设剪辑效果，AI 将自动完成后期制作。"}
                 </p>
               </div>
             </div>
