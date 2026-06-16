@@ -21,6 +21,7 @@ import {
   Share2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { UserMenu } from "@/components/user-menu"
 
 type NavItem = {
   label: string
@@ -243,18 +244,8 @@ export function DashboardSidebar({ active, onSelect }: DashboardSidebarProps) {
         </ul>
       </nav>
 
-      {/* User card */}
-      <div className="m-3 rounded-xl border border-sidebar-border bg-card p-3 soft-shadow">
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary">
-            Yt
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium text-foreground">各位朋友</p>
-            <p className="truncate text-[11px] text-muted-foreground">Pro 会员 · 已激活</p>
-          </div>
-        </div>
-      </div>
+      {/* User menu */}
+      <UserMenu />
     </aside>
   )
 }
