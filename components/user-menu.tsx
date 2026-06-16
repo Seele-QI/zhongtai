@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
-import { LogOut, LogIn, ChevronUp, Coins, Loader2 } from "lucide-react"
+import { LogOut, LogIn, ChevronUp, Coins, Loader2, Mail } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -16,17 +16,19 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 
-type Me = { user: { id: number; phone_masked: string }; balance: number } | null
+type Me = { user: { id: number; email_masked: string }; balance: number } | null
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export function UserMenu() {
   const router = useRouter()
   const [me, setMe] = useState<Me | undefined>(undefined)
   const [openLogin, setOpenLogin] = useState(false)
   const [openMenu, setOpenMenu] = useState(false)
-  const [phone, setPhone] = useState("")
-  const [code, setCode] = useState("")
+  const [email, setEmail] = useState("")
+  const [sending, setSending] = useState(false)
+  const [sent, setSent] = useState(false)
   const [cooldown, setCooldown] = useState(0)
-  const [submitting, setSubmitting] = useState(false)
 
   const refresh = async () => {
     try {
@@ -63,58 +65,30 @@ export function UserMenu() {
     return () => document.removeEventListener("click", close)
   }, [openMenu])
 
-  const sendCode = async () => {
-    if (!/^1\d{10}$/.test(phone)) {
-      toast.error("请输入 11 位手机号")
+  const sendLink = async () => {
+    if (!EMAIL_RE.test(email)) {
+      toast.error("请输入有效邮箱地址")
       return
     }
+    setSending(true)
     try {
-      const r = await fetch("/api/auth/send-code", {
+      const r = await fetch("/api/auth/send-link", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ phone }),
+        body: JSON.stringify({ email }),
         credentials: "include",
       })
       if (r.ok) {
+        setSent(true)
         setCooldown(60)
-        toast.success("验证码已发送（dev 模式请查 FastAPI 日志）")
+        toast.success("登录链接已发送到你的邮箱")
       } else {
         toast.error("发送失败，请稍后再试")
       }
     } catch {
       toast.error("网络错误")
-    }
-  }
-
-  const onLogin = async () => {
-    if (!/^1\d{10}$/.test(phone) || !/^\d{6}$/.test(code)) {
-      toast.error("请输入手机号与 6 位验证码")
-      return
-    }
-    setSubmitting(true)
-    try {
-      const r = await fetch("/api/auth/verify-code", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ phone, code }),
-        credentials: "include",
-      })
-      if (r.ok) {
-        toast.success("登录成功，赠送 100 积分")
-        setOpenLogin(false)
-        setPhone("")
-        setCode("")
-        await refresh()
-        setOpenMenu(false)
-        router.refresh()
-      } else {
-        const err = (await r.json().catch(() => null)) as { detail?: { message?: string } } | null
-        toast.error(err?.detail?.message ?? "登录失败")
-      }
-    } catch {
-      toast.error("网络错误")
     } finally {
-      setSubmitting(false)
+      setSending(false)
     }
   }
 
@@ -122,7 +96,7 @@ export function UserMenu() {
     try {
       await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
     } catch {
-      // 忽略错误——本地清空状态即可
+      // ignore
     }
     setMe(null)
     setOpenMenu(false)
@@ -155,59 +129,63 @@ export function UserMenu() {
             登录 / 注册
           </Button>
         </div>
-        <Dialog open={openLogin} onOpenChange={setOpenLogin}>
+        <Dialog
+          open={openLogin}
+          onOpenChange={(o) => {
+            setOpenLogin(o)
+            if (!o) {
+              setSent(false)
+              setEmail("")
+              setCooldown(0)
+            }
+          }}
+        >
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
-              <DialogTitle>手机号登录</DialogTitle>
+              <DialogTitle>邮箱登录</DialogTitle>
               <DialogDescription>未注册账号登录后自动创建，并赠送 100 积分。</DialogDescription>
             </DialogHeader>
-            <div className="space-y-4 py-2">
-              <div className="space-y-2">
-                <Label htmlFor="um-phone">手机号</Label>
-                <Input
-                  id="um-phone"
-                  inputMode="numeric"
-                  maxLength={11}
-                  placeholder="13800000000"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value.replace(/\D/g, ""))}
-                />
+            {sent ? (
+              <div className="space-y-3 py-4 text-center">
+                <Mail className="mx-auto h-10 w-10 text-primary" />
+                <p className="text-sm">
+                  登录链接已发送到 <span className="font-mono">{email}</span>
+                </p>
+                <p className="text-xs text-muted-foreground">15 分钟内有效。点击邮件中的链接即可登录。</p>
+                <Button variant="outline" size="sm" disabled={cooldown > 0} onClick={sendLink}>
+                  {cooldown > 0 ? `${cooldown}s 后重发` : "重新发送"}
+                </Button>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="um-code">验证码</Label>
-                <div className="flex gap-2">
-                  <Input
-                    id="um-code"
-                    inputMode="numeric"
-                    maxLength={6}
-                    placeholder="6 位数字"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-                  />
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    disabled={cooldown > 0}
-                    onClick={sendCode}
-                  >
-                    {cooldown > 0 ? `${cooldown}s` : "获取验证码"}
-                  </Button>
+            ) : (
+              <>
+                <div className="space-y-4 py-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="um-email">邮箱</Label>
+                    <Input
+                      id="um-email"
+                      type="email"
+                      placeholder="you@example.com"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                    />
+                  </div>
                 </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button onClick={onLogin} disabled={submitting}>
-                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : "登录"}
-              </Button>
-            </DialogFooter>
+                <DialogFooter>
+                  <Button onClick={sendLink} disabled={sending}>
+                    {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : "发送登录链接"}
+                  </Button>
+                </DialogFooter>
+              </>
+            )}
           </DialogContent>
         </Dialog>
       </>
     )
   }
 
-  // 已登录：手机号末 2 位做头像
-  const avatar = me.user.phone_masked.slice(-2)
+  // 已登录：邮箱 @ 前 1 + 末 1 做头像
+  const local = me.user.email_masked.split("@")[0]
+  const avatar = (local[0] || "?") + (local.slice(-1) || "")
   return (
     <div className="m-3" data-user-menu>
       <button
@@ -216,10 +194,10 @@ export function UserMenu() {
         className="flex w-full items-center gap-3 rounded-xl border border-sidebar-border bg-card p-3 text-left transition-colors hover:bg-accent/40 soft-shadow"
       >
         <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-sm font-semibold text-primary">
-          {avatar}
+          {avatar.toUpperCase()}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-foreground">{me.user.phone_masked}</p>
+          <p className="truncate text-sm font-medium text-foreground">{me.user.email_masked}</p>
           <p className="flex items-center gap-1 truncate text-[11px] text-muted-foreground">
             <Coins className="h-3 w-3 text-amber-500" />
             <span className="tabular-nums">{me.balance}</span>
