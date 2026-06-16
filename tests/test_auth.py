@@ -1,71 +1,107 @@
 import os
-import sqlite3
 import sys
-import tempfile
 
-_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_tmp.close()
-os.environ["CREDIT_DB_OVERRIDE"] = _tmp.name
-os.environ["PHONE_HASH_SALT"] = "test-salt"
+# 必须在 import lib 之前设好环境变量
+from tests.conftest import setup_test_db
+
+setup_test_db()
+os.environ["EMAIL_HASH_SALT"] = "test-salt"
 os.environ["CREDIT_REGISTER_BONUS"] = "100"
-os.environ["CREDIT_SMS_MAX_ATTEMPTS"] = "5"
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from scripts.init_credit_db import SCHEMA
-
-_init = sqlite3.connect(_tmp.name)
-_init.executescript(SCHEMA)
-_init.commit()
-_init.close()
+os.environ["CREDIT_EMAIL_TOKEN_TTL_SECONDS"] = "900"
 
 from lib import auth  # noqa: E402
 
 
-def test_hash_phone_deterministic():
-    assert auth.hash_phone("13800000001") == auth.hash_phone("13800000001")
+def test_hash_email_deterministic():
+    assert auth.hash_email("a@b.com") == auth.hash_email("a@b.com")
 
 
-def test_hash_phone_differs_by_salt():
-    a = auth.hash_phone("13800000001")
-    assert a == auth.hash_phone("13800000001")
-    assert len(a) == 64  # sha256 hex
+def test_hash_email_case_insensitive():
+    assert auth.hash_email("Alice@Example.com") == auth.hash_email("alice@example.com")
 
 
-def test_mask_phone_standard():
-    assert auth.mask_phone("13800001234") == "138****1234"
+def test_hash_email_64_hex():
+    h = auth.hash_email("x@y.com")
+    assert len(h) == 64
+    int(h, 16)  # must parse
 
 
-def test_mask_phone_short():
-    assert auth.mask_phone("12345") == "***"
+def test_mask_email_standard():
+    assert auth.mask_email("alice@example.com") == "a**e@example.com"
 
 
-def test_sms_code_roundtrip():
-    auth.save_sms_code("13800000010", "123456")
-    assert auth.verify_sms_code("13800000010", "123456") is True
-    assert auth.verify_sms_code("13800000010", "000000") is False
+def test_mask_email_short_local():
+    assert auth.mask_email("ab@gmail.com") == "a*@gmail.com"
 
 
-def test_sms_code_max_attempts_locks():
-    auth.save_sms_code("13800000011", "111111")
-    for _ in range(5):
-        auth.verify_sms_code("13800000011", "000000")
-    assert auth.verify_sms_code("13800000011", "111111") is False
+def test_mask_email_no_at():
+    assert auth.mask_email("not-an-email") == "***"
 
 
-def test_sms_code_used_invalidated():
-    auth.save_sms_code("13800000012", "222222")
-    assert auth.verify_sms_code("13800000012", "222222") is True
-    # 第二次相同 code 应失败（已 used）
-    assert auth.verify_sms_code("13800000012", "222222") is False
+def test_token_roundtrip():
+    tok = auth.generate_token()
+    assert len(tok) >= 32  # base64url of 32 bytes
+    auth.save_email_token("alice@example.com", tok)
+    info = auth.consume_email_token(tok)
+    assert info is not None
+    assert info["email_hash"] == auth.hash_email("alice@example.com")
+    assert info["email_masked"] == "a**e@example.com"
+
+
+def test_token_single_use():
+    tok = auth.generate_token()
+    auth.save_email_token("alice@example.com", tok)
+    assert auth.consume_email_token(tok) is not None
+    assert auth.consume_email_token(tok) is None
+
+
+def test_token_invalid_returns_none():
+    auth.save_email_token("alice@example.com", auth.generate_token())
+    assert auth.consume_email_token("nonexistent-token") is None
+
+
+def test_token_expired_returns_none():
+    os.environ["CREDIT_EMAIL_TOKEN_TTL_SECONDS"] = "0"  # expired immediately
+    # Note: env var read at module import; we need to set before save
+    # This test is best-effort; rely on DB query for expires_at
+    import importlib
+    importlib.reload(auth)
+    tok = auth.generate_token()
+    auth.save_email_token("alice@example.com", tok)
+    assert auth.consume_email_token(tok) is None
+    # restore
+    os.environ["CREDIT_EMAIL_TOKEN_TTL_SECONDS"] = "900"
 
 
 def test_get_or_create_user_idempotent():
-    a = auth.get_or_create_user("13800000020")
-    b = auth.get_or_create_user("13800000020")
+    a = auth.get_or_create_user_by_hash(auth.hash_email("x@y.com"), "x**@y.com")
+    b = auth.get_or_create_user_by_hash(auth.hash_email("x@y.com"), "x**@y.com")
     assert a == b
 
 
 def test_get_or_create_user_registers_bonus():
-    uid = auth.get_or_create_user("13800000030")
     from lib.credit import get_account
+    uid = auth.get_or_create_user_by_hash(auth.hash_email("new@user.com"), "n**w@user.com")
     assert get_account(uid).balance == 100
+
+
+def test_session_create_and_destroy():
+    import time
+    from lib.db import connect
+    uid = auth.get_or_create_user_by_hash(auth.hash_email("sess@x.com"), "s**s@x.com")
+    ua, ip = "ua", "1.2.3.4"
+    sid = auth.create_session(uid, ua, ip)
+    # check session row
+    conn = connect()
+    try:
+        row = conn.execute("SELECT user_id FROM sessions WHERE id = ?", (sid,)).fetchone()
+        assert row["user_id"] == uid
+    finally:
+        conn.close()
+    auth.destroy_session(sid)
+    conn = connect()
+    try:
+        row = conn.execute("SELECT id FROM sessions WHERE id = ?", (sid,)).fetchone()
+        assert row is None
+    finally:
+        conn.close()

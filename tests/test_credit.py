@@ -1,36 +1,27 @@
 import os
-import sqlite3
-import sys
-import tempfile
+import threading
 
-_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-_tmp.close()
-os.environ["CREDIT_DB_OVERRIDE"] = _tmp.name
-os.environ["PHONE_HASH_SALT"] = "test-salt-do-not-use-in-prod"
+from tests.conftest import setup_test_db
+
+setup_test_db()
+os.environ["EMAIL_HASH_SALT"] = "test-salt-do-not-use-in-prod"
 os.environ["CREDIT_REGISTER_BONUS"] = "100"
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from scripts.init_credit_db import SCHEMA
-
-_init = sqlite3.connect(_tmp.name)
-_init.executescript(SCHEMA)
-_init.commit()
-_init.close()
-
-from lib import credit, auth  # noqa: E402
+from lib import auth, credit  # noqa: E402
 
 
-def _make_user(phone="13800000001") -> int:
-    return auth.get_or_create_user(phone)
+def _make_user(email="default@test.com"):
+    h = auth.hash_email(email)
+    return auth.get_or_create_user_by_hash(h, auth.mask_email(email))
 
 
 def test_register_bonus_100():
-    uid = _make_user("13800000001")
+    uid = _make_user("a@b.com")
     assert credit.get_account(uid).balance == 100
 
 
 def test_consume_decrements_balance():
-    uid = _make_user("13800000002")
+    uid = _make_user("c@d.com")
     after = credit.consume(uid, 30, ref_id="t")
     assert after == 70
     assert credit.get_account(uid).balance == 70
@@ -38,7 +29,7 @@ def test_consume_decrements_balance():
 
 def test_consume_insufficient_raises_402():
     from fastapi import HTTPException
-    uid = _make_user("13800000003")
+    uid = _make_user("e@f.com")
     raised = False
     try:
         credit.consume(uid, 9999)
@@ -46,25 +37,25 @@ def test_consume_insufficient_raises_402():
         assert e.status_code == 402
         assert e.detail["code"] == "INSUFFICIENT_CREDIT"
         raised = True
-    assert raised, "应该抛 402"
+    assert raised
 
 
 def test_refund_increments_balance():
-    uid = _make_user("13800000004")
+    uid = _make_user("g@h.com")
     credit.consume(uid, 50)
     credit.refund(uid, 50, ref_id="t")
     assert credit.get_account(uid).balance == 100
 
 
 def test_recompute_balance_matches():
-    uid = _make_user("13800000005")
+    uid = _make_user("i@j.com")
     credit.consume(uid, 20)
     credit.refund(uid, 10)
     assert credit.recompute_balance(uid) == credit.get_account(uid).balance
 
 
 def test_ledger_contains_bonus_and_consume():
-    uid = _make_user("13800000006")
+    uid = _make_user("k@l.com")
     credit.consume(uid, 10)
     items = credit.list_ledger(uid, 10)
     types = {i["type"] for i in items}
@@ -73,19 +64,18 @@ def test_ledger_contains_bonus_and_consume():
 
 
 def test_consume_zero_or_negative_raises():
-    uid = _make_user("13800000007")
+    uid = _make_user("m@n.com")
     for bad in (0, -5):
         raised = False
         try:
             credit.consume(uid, bad)
         except Exception:
             raised = True
-        assert raised, f"cost={bad} 应该抛"
+        assert raised, f"cost={bad} should raise"
 
 
 def test_concurrent_consume_never_negative():
-    import threading
-    uid = _make_user("13800000008")
+    uid = _make_user("o@p.com")
     initial = credit.get_account(uid).balance
     errors = []
 
@@ -102,5 +92,4 @@ def test_concurrent_consume_never_negative():
         t.join()
     final = credit.get_account(uid).balance
     assert final >= 0
-    # 两个 worker 各自想扣 80；一个成功，一个抛 402
     assert initial - final == 80 or len(errors) == 1
