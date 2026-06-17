@@ -78,6 +78,25 @@ type Props = {
   initialScript?: string
 }
 
+type EditTaskResponse = {
+  edit_job_id: string
+  task_id?: string
+  status: string
+  progress?: number
+  preset?: string
+  source?: string
+  output_video_url?: string
+  error?: string
+}
+
+type ManualEditResponse = {
+  task_id: string
+  status: string
+  post_video_url?: string
+  post_stage?: string
+  post_progress?: number
+}
+
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
 /* ------------------------------------------------------------------ */
@@ -250,6 +269,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   // 临时未持久化的状态
   const [image, setImage] = React.useState<UploadedImage | null>(null)
   const [audio, setAudio] = React.useState<UploadedAudio | null>(null)
+  const [manualVideoFile, setManualVideoFile] = React.useState<File | null>(null)
+  const [manualVideoPreview, setManualVideoPreview] = React.useState("")
+  const [manualUploadBusy, setManualUploadBusy] = React.useState(false)
   const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollSessionRef = React.useRef(0)
   const pollInFlightRef = React.useRef(false)
@@ -315,6 +337,78 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const genderRef = React.useRef(gender)
   genderRef.current = gender
   const workflowUi = React.useMemo(() => deriveWorkflowUi(taskState), [taskState])
+
+  React.useEffect(() => {
+    return () => {
+      if (manualVideoPreview) URL.revokeObjectURL(manualVideoPreview)
+    }
+  }, [manualVideoPreview])
+
+  const handleManualVideoUpload = React.useCallback(async (file: File) => {
+    if (!file.type.startsWith("video/")) {
+      toast({ title: "文件类型不支持", description: "请选择 mp4 / mov / webm 等视频文件", variant: "destructive" })
+      return
+    }
+    setManualVideoFile(file)
+    const preview = URL.createObjectURL(file)
+    setManualVideoPreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return preview
+    })
+    try {
+      setManualUploadBusy(true)
+      const base64 = await fileToBase64(file)
+      const base = getFastapiBase()
+      if (!base) throw new Error("请配置 NEXT_PUBLIC_FASTAPI_URL")
+      const resp = await fetch(`${base}/api/video/edit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_base64: base64,
+          preset: selectedPreset || "smooth",
+          subtitle_text: scriptRef.current.trim(),
+          source: "manual",
+        }),
+      })
+      const data = (await resp.json()) as EditTaskResponse & { detail?: string }
+      if (!resp.ok) throw new Error(data.detail || "手动剪辑失败")
+      const editJobId = data.edit_job_id
+      while (true) {
+        const statusResp = await fetch(`${base}/api/video/edit/status?editJobId=${encodeURIComponent(editJobId)}`)
+        const statusData = (await statusResp.json()) as EditTaskResponse & { detail?: string }
+        if (!statusResp.ok) throw new Error(statusData.detail || "查询剪辑状态失败")
+        if (statusData.status === "success" && statusData.output_video_url) {
+          const finalUrl = statusData.output_video_url.startsWith("http")
+            ? statusData.output_video_url
+            : `${base.replace(/\/$/, "")}${statusData.output_video_url}`
+          setVideoUrl(finalUrl)
+          updateTask({
+            status: "published",
+            currentStage: "done",
+            isProcessing: false,
+            videoUrl: finalUrl,
+            postProcessingStage: "published",
+            postProcessingProgress: 100,
+            postProcessingErrorMessage: "",
+            progress: 100,
+          })
+          toast({ title: "手动剪辑完成", description: "已对上传视频执行后处理" })
+          break
+        }
+        if (statusData.status === "failed") {
+          throw new Error(statusData.error || "手动剪辑失败")
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500))
+      }
+    } catch (error) {
+      toast({ title: "手动上传后处理失败", description: error instanceof Error ? error.message : "请检查后端服务与视频格式", variant: "destructive" })
+    } finally {
+      setManualUploadBusy(false)
+    }
+  }, [setVideoUrl, toast, updateTask])
+
+  const manualVideoUrl = React.useMemo(() => manualVideoPreview, [manualVideoPreview])
+  const manualUploadLabel = manualVideoFile ? `${manualVideoFile.name} · ${formatSize(manualVideoFile.size)}` : "未选择视频文件"
   const activeStep = workflowUi.activeStep
   const stepStatuses = workflowUi.stepStatuses
   const readableTaskErrorMessage = errorMessage || getTaskHealthMessage(taskState)
@@ -516,13 +610,13 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           const now = Date.now()
           updateTask({ lastStatusAt: now, resumeGraceUntil: 0, pollErrorCount: 0, lastPollError: "" })
           const s = sd.status?.toLowerCase()
-          if (s === "success") {
+          if (s === "success" || s === "post_processing" || s === "published") {
             const vUrl = sd.video_url || sd.videoUrl || ""
             const cUrl = sd.cover_url || sd.coverUrl || ""
             const postUrl = sd.post_video_url || sd.postVideoUrl || ""
             const postStage = (sd.post_stage || sd.postStage || "").toLowerCase()
             const postProgress = typeof sd.post_progress === "number" ? sd.post_progress : (typeof sd.postProgress === "number" ? sd.postProgress : 0)
-            const nextStageProgress = { voiceClone: 100, videoGen: 100, editing: 0 }
+            const nextStageProgress = { voiceClone: 100, videoGen: 100, editing: postStage === "published" ? 100 : Math.max(10, postProgress) }
 
             if (postStage === "running" || s === "post_processing") {
               updateTask({
@@ -552,7 +646,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 isProcessing: false,
                 errorMessage: "",
                 editingErrorMessage: "",
-                videoUrl: vUrl,
+                videoUrl: postUrl || vUrl,
                 coverUrl: cUrl,
                 postProcessingStage: "published",
                 postProcessingProgress: 100,
@@ -751,9 +845,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
   }, [audioBase64, canGenerate, failTask, gender, imageBase64, isProcessing, script, startBackgroundPoll, updateTask])
 
-  React.useEffect(() => {
-    return () => { stopBackgroundPoll() }
-  }, [stopBackgroundPoll])
+  // Keep background polling alive across page/tab switches by not tearing it down on unmount.
+  // The poll loop is already guarded by the current taskId/session token, so it can safely
+  // continue until completion or explicit cancel/failure.
 
   // 重新挂载时恢复轮询（切页回来时 taskId 还在但 pollRef 已失）
   React.useEffect(() => {
@@ -832,14 +926,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
   const handleApplyEditing = React.useCallback(async () => {
     if (!selectedPreset || isEditing) return
-    if (isLocalPreviewMode) {
-      toast({
-        title: "本地预览模式不支持后端剪辑",
-        description: "请先完成真实视频生成，再提交剪辑任务。",
-        variant: "destructive",
-      })
-      return
-    }
 
     const resetEditingProgress = { ...taskStateRef.current.stageProgress, editing: 0 }
     setIsEditing(true)
@@ -866,32 +952,64 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
 
     try {
-      const res = await fetch("/api/video/edit", {
+      const base = getFastapiBase()
+      if (!base) {
+        handleEditingFailure("请配置 NEXT_PUBLIC_FASTAPI_URL", "缺少后端配置")
+        return
+      }
+      const res = await fetch(`${base}/api/video/edit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          videoUrl,
+          task_id: taskIdRef.current,
+          video_url: videoUrl,
           preset: selectedPreset,
-          subtitleText: script.trim(),
+          subtitle_text: script.trim(),
+          source: isLocalPreviewMode ? "manual" : "generated",
         }),
       })
-      const data = await res.json()
+      const data = (await res.json()) as EditTaskResponse & { detail?: string }
       if (!res.ok) {
         handleEditingFailure(typeof data.detail === "string" ? data.detail : "剪辑失败，请重试")
-      } else if (data.editedVideoUrl) {
-        const completedStageProgress = { ...taskStateRef.current.stageProgress, editing: 100 }
-        setVideoUrl(data.editedVideoUrl)
+        return
+      }
+      const editJobId = data.edit_job_id
+      while (true) {
+        const statusResp = await fetch(`${base}/api/video/edit/status?editJobId=${encodeURIComponent(editJobId)}`)
+        const statusData = (await statusResp.json()) as EditTaskResponse & { detail?: string }
+        if (!statusResp.ok) {
+          handleEditingFailure(typeof statusData.detail === "string" ? statusData.detail : "查询剪辑状态失败")
+          return
+        }
+        if (statusData.status === "success" && statusData.output_video_url) {
+          const completedStageProgress = { ...taskStateRef.current.stageProgress, editing: 100 }
+          const finalUrl = statusData.output_video_url.startsWith("http")
+            ? statusData.output_video_url
+            : `${base.replace(/\/$/, "")}${statusData.output_video_url}`
+          setVideoUrl(finalUrl)
+          updateTask({
+            currentStage: "done",
+            status: "published",
+            errorMessage: "",
+            editingErrorMessage: "",
+            progress: 100,
+            videoUrl: finalUrl,
+            postProcessingStage: "published",
+            postProcessingProgress: 100,
+            stageProgress: completedStageProgress,
+          })
+          toast({ title: "剪辑完成", description: "视频已应用所选效果，可切换预设再次剪辑" })
+          return
+        }
+        if (statusData.status === "failed") {
+          handleEditingFailure(statusData.error || "剪辑失败，请重试")
+          return
+        }
         updateTask({
-          currentStage: "done",
-          status: "success",
-          errorMessage: "",
-          editingErrorMessage: "",
-          progress: 100,
-          stageProgress: completedStageProgress,
+          postProcessingStage: statusData.status,
+          postProcessingProgress: typeof statusData.progress === "number" ? statusData.progress : 30,
         })
-        toast({ title: "剪辑完成", description: "视频已应用所选效果，可切换预设再次剪辑" })
-      } else {
-        handleEditingFailure("剪辑服务未返回输出视频")
+        await new Promise((resolve) => window.setTimeout(resolve, 1500))
       }
     } catch {
       handleEditingFailure("剪辑请求失败，请检查服务是否启动", "网络错误")
@@ -1191,13 +1309,13 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       stageProgress: { voiceClone: 100, videoGen: 100, editing: 0 },
                     })
                     toast({
-                      title: "进入本地预览模式",
-                      description: "仅用于前端预览，不会把图片地址作为视频源提交后端剪辑。",
+                      title: "进入剪辑调试模式",
+                      description: "现在可以手动上传视频，直接测试后处理效果。",
                     })
                   }}
                   className="rounded-xl px-4 py-2 text-[12px] font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-white/5 dark:hover:text-slate-300"
                 >
-                  🎬 跳过生成，直接进入剪辑测试
+                  🎬 跳过生成，直接剪辑
                 </button>
               )}
             </div>
@@ -1244,11 +1362,12 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 {/* Voice Clone Progress Bar */}
                 {stepStatuses[2] === "loading" && (
                   <div className="mt-2 space-y-1">
-                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
+                    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
                       <div
-                        className="h-full rounded-full bg-gradient-to-r from-rose-500 to-pink-500 transition-all duration-500"
+                        className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-rose-500 via-pink-500 to-fuchsia-500 transition-all duration-500"
                         style={{ width: `${stageProgress.voiceClone}%` }}
                       />
+                      <div className="absolute inset-0 bg-[linear-gradient(110deg,transparent_20%,rgba(255,255,255,0.45)_40%,transparent_60%)] bg-[length:200%_100%] animate-[progress-shine_1.5s_linear_infinite]" />
                     </div>
                     <div className="flex items-center justify-between">
                       <p className="text-[11px] text-slate-400">{stageProgress.voiceClone}%</p>
@@ -1315,11 +1434,12 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   {/* Progress Bar — videoGen */}
                   {stepStatuses[3] === "loading" && (
                     <div className="mt-3 space-y-1.5">
-                      <div className="h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
+                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
                         <div
-                          className="h-full rounded-full bg-gradient-to-r from-rose-500 to-pink-500 transition-all duration-500"
+                          className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-rose-500 via-pink-500 to-fuchsia-500 transition-all duration-500"
                           style={{ width: `${stageProgress.videoGen}%` }}
                         />
+                        <div className="absolute inset-0 bg-[linear-gradient(110deg,transparent_20%,rgba(255,255,255,0.42)_40%,transparent_60%)] bg-[length:200%_100%] animate-[progress-shine_1.5s_linear_infinite]" />
                       </div>
                       <p className="text-[11px] text-slate-400">{stageProgress.videoGen}%</p>
                     </div>
@@ -1395,18 +1515,35 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
             {isLocalPreviewMode && (
               <div className="overflow-hidden rounded-2xl border border-slate-200/60 bg-white dark:border-white/10 dark:bg-white/5">
-                <img
-                  src={localPreviewImageSrc}
-                  alt="本地剪辑测试预览"
-                  className="w-full object-cover"
-                  style={{ maxHeight: "480px" }}
-                />
-                <div className="border-t border-slate-100 px-4 py-3 text-[12px] text-slate-500 dark:border-white/5 dark:text-slate-400">
-                  当前为本地预览模式，仅用于验证界面与预设选择，不会请求后端剪辑。
-                  <div className="mt-3">
-                    <Button variant="outline" size="sm" onClick={handleReturnFromLocalPreview}>
-                      返回素材准备
-                    </Button>
+                <div className="grid gap-4 p-4 lg:grid-cols-[1.2fr_0.8fr]">
+                  <div className="space-y-3">
+                    <div className="overflow-hidden rounded-xl border border-slate-200/60 bg-black dark:border-white/10">
+                      {manualVideoPreview ? (
+                        <video src={manualVideoPreview} controls className="w-full" style={{ maxHeight: "380px" }} />
+                      ) : (
+                        <div className="flex h-[240px] items-center justify-center text-[13px] text-slate-400">请先上传视频</div>
+                      )}
+                    </div>
+                    <p className="text-[12px] text-slate-500 dark:text-slate-400">当前为剪辑调试模式，适合直接上传视频验证字幕烧录、BGM、名片和模板效果。</p>
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={handleReturnFromLocalPreview} disabled={manualUploadBusy}>
+                        返回素材准备
+                      </Button>
+                      <span className="text-[12px] text-slate-400">{manualUploadLabel}</span>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <UploadZone
+                      accept="video/*"
+                      label={manualUploadBusy ? "处理中…" : "手动上传视频"}
+                      icon={Play}
+                      hint="用于直接进入后处理调试，不走生成流程"
+                      disabled={manualUploadBusy}
+                      onFile={(f) => void handleManualVideoUpload(f)}
+                    />
+                    <div className="rounded-xl border border-dashed border-slate-200 p-3 text-[12px] text-slate-500 dark:border-white/10 dark:text-slate-400">
+                      上传后会自动执行后处理，并覆盖展示最终成片。
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1500,7 +1637,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-5 dark:border-white/5">
                 <Button
                   onClick={() => { void handleApplyEditing() }}
-                  disabled={isEditing || isLocalPreviewMode}
+                  disabled={isEditing || !videoUrl}
                   className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-rose-500 to-pink-500 px-8 py-3.5 text-[15px] font-bold text-white shadow-lg shadow-rose-500/25 transition-all hover:from-rose-600 hover:to-pink-600 active:scale-[0.97] disabled:opacity-60"
                 >
                   {isEditing ? (
@@ -1515,9 +1652,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                     </>
                   )}
                 </Button>
-                {isLocalPreviewMode && (
+                {!videoUrl && (
                   <p className="text-center text-[12px] text-slate-500 dark:text-slate-400">
-                    当前为本地预览模式，可测试预设选择，但不会发起后端剪辑。
+                    请先准备好视频，再应用剪辑效果。
                   </p>
                 )}
                 {!isLocalPreviewMode && editingErrorMessage && !isEditing && (

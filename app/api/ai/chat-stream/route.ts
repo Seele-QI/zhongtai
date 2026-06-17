@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 
-import { resolveAgentSystemPrompt } from "@/lib/prompts/copywriting-agent-systems"
+import { buildCopywritingEnrichedSystemPrompt } from "@/lib/prompts/copywriting-agent-systems"
 import { getWorkflowKnowledgeForAgent } from "@/lib/prompts/copywriting-workflow-knowledge"
 import { deepseekApiKeyMissingUserMessage, getDeepseekApiKey, readServerEnv } from "@/lib/server-env"
 
@@ -168,18 +168,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ detail: "缺少 agentName" }, { status: 400 })
   }
 
-  const systemContent = resolveAgentSystemPrompt(agentName)
   const workflowKnowledge = getWorkflowKnowledgeForAgent(agentName)
   const memoryContext = typeof body.memoryContext === "string" ? body.memoryContext.trim() : ""
 
-  // Build enriched system prompt: agent prompt + workflow knowledge + user memory
-  const enrichedSystemContent = [
-    systemContent,
+  const enrichedSystemContent = buildCopywritingEnrichedSystemPrompt({
+    agentName,
     workflowKnowledge,
     memoryContext,
-  ]
-    .filter(Boolean)
-    .join("\n\n---\n\n")
+  })
 
   const historyMessages: { role: string; content: string }[] = conversationHistory.map((t) => ({
     role: t.role,
@@ -247,7 +243,7 @@ export async function POST(request: Request) {
       model: arkEndpointId,
       stream: true,
       messages: [
-        { role: "system", content: systemContent },
+        { role: "system", content: enrichedSystemContent },
         ...historyMessages,
         { role: "user", content: userContentParts },
       ],
@@ -268,7 +264,11 @@ export async function POST(request: Request) {
     requestBody = {
       model: visionModel,
       stream: true,
-      messages: [{ role: "system", content: systemContent }, ...historyMessages, { role: "user", content: parts }],
+      messages: [
+        { role: "system", content: enrichedSystemContent },
+        ...historyMessages,
+        { role: "user", content: parts },
+      ],
     }
     providerLabel = "DeepSeek"
   } else {

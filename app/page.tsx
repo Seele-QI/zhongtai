@@ -301,6 +301,11 @@ export default function Page() {
                 })
                 setIsCopywritingMode(true)
               }}
+              onJumpToVideo={(script) => {
+                setInitialVideoScript(script)
+                setAgentChatOpen(false)
+                setActiveView("视频创作")
+              }}
             />
           ) : (
             <ChatWorkspace

@@ -27,6 +27,10 @@ import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { toast } from "@/hooks/use-toast"
 import {
+  splitCopywritingScriptVersions,
+  type CopywritingScriptVersion,
+} from "@/lib/copywriting-script-format"
+import {
   readUserMemory,
   updateUserMemory,
   hasUserMemory,
@@ -184,6 +188,106 @@ function CopyButton({ text }: { text: string }) {
         </>
       )}
     </button>
+  )
+}
+
+function ScriptVersionCard({
+  version,
+  index,
+  onJumpToVideo,
+}: {
+  version: CopywritingScriptVersion
+  index: number
+  onJumpToVideo?: (script: string) => void
+}) {
+  const title = version.title ?? `口播稿 ${index + 1}`
+  const hasPlainText = Boolean(version.plainText.trim())
+
+  return (
+    <article className="rounded-2xl border border-slate-200/70 bg-gradient-to-br from-white via-white to-slate-50/80 p-4 shadow-sm dark:border-white/10 dark:from-white/8 dark:via-white/5 dark:to-transparent">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-slate-400">
+            Oral Script
+          </p>
+          <h4 className="mt-1 text-[15px] font-semibold text-slate-900 dark:text-slate-100">
+            {title}
+          </h4>
+        </div>
+        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-500 dark:bg-white/10 dark:text-slate-300">
+          {hasPlainText ? "可直接使用" : "需重新生成"}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-xl bg-slate-50/80 p-4 dark:bg-slate-950/40">
+        {hasPlainText ? (
+          <div className="prose prose-sm max-w-none whitespace-pre-wrap text-slate-700 dark:prose-invert dark:text-slate-200 prose-p:my-1.5 prose-headings:my-2 prose-code:text-[13px]">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{version.plainText}</ReactMarkdown>
+          </div>
+        ) : (
+          <p className="text-[13px] leading-6 text-amber-600 dark:text-amber-300">
+            这一版没有提取出可直接朗读的纯口播稿，请调整要求后重新生成。
+          </p>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {hasPlainText && <CopyButton text={version.plainText} />}
+        {onJumpToVideo && (
+          <button
+            type="button"
+            onClick={() => onJumpToVideo(version.plainText)}
+            disabled={!hasPlainText}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-all",
+              hasPlainText
+                ? "bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/15"
+                : "cursor-not-allowed bg-slate-100 text-slate-400 dark:bg-white/10 dark:text-slate-500",
+            )}
+          >
+            <Clapperboard className="h-3.5 w-3.5" />
+            {hasPlainText ? "视频生成跳转" : "暂无可跳转文案"}
+          </button>
+        )}
+      </div>
+    </article>
+  )
+}
+
+function AssistantMessageContent({
+  content,
+  onJumpToVideo,
+}: {
+  content: string
+  onJumpToVideo?: (script: string) => void
+}) {
+  const versions = React.useMemo(() => splitCopywritingScriptVersions(content), [content])
+  const hasScriptCards = versions.length > 0 && !content.startsWith("**出错了**")
+
+  if (!hasScriptCards) {
+    return (
+      <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1.5 prose-headings:my-2 prose-code:text-[13px]">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl border border-slate-200/70 bg-slate-50/80 px-3 py-2 text-[12px] text-slate-500 dark:border-white/10 dark:bg-white/5 dark:text-slate-400">
+        已整理为 {versions.length} 个可直接朗读的口播版本，可单独复制或跳转到视频创作。
+      </div>
+      <div className="grid gap-3">
+        {versions.map((version, index) => (
+          <ScriptVersionCard
+            key={`${version.title ?? "script"}-${index}`}
+            version={version}
+            index={index}
+            onJumpToVideo={onJumpToVideo}
+          />
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -717,11 +821,10 @@ export function CopywritingChatWorkspace({
                       >
                         {msg.role === "assistant" ? (
                           msg.content ? (
-                            <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1.5 prose-headings:my-2 prose-code:text-[13px]">
-                              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                {msg.content}
-                              </ReactMarkdown>
-                            </div>
+                            <AssistantMessageContent
+                              content={msg.content}
+                              onJumpToVideo={onJumpToVideo}
+                            />
                           ) : (
                             <div className="flex items-center gap-2 text-slate-400">
                               <Loader2 className="h-4 w-4 animate-spin" />
@@ -734,19 +837,9 @@ export function CopywritingChatWorkspace({
                       </div>
 
                       {/* Copy Button (assistant only, when content exists) */}
-                      {msg.role === "assistant" && msg.content && (
+                      {msg.role === "assistant" && msg.content && !splitCopywritingScriptVersions(msg.content).length && (
                         <div className="mt-1 flex justify-start gap-2">
                           <CopyButton text={msg.content} />
-                          {onJumpToVideo && (
-                            <button
-                              type="button"
-                              onClick={() => onJumpToVideo(msg.content)}
-                              className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-slate-400 transition-all hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-500/10 dark:hover:text-rose-400"
-                            >
-                              <Clapperboard className="h-3 w-3" />
-                              生成视频
-                            </button>
-                          )}
                         </div>
                       )}
                     </div>

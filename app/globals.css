@@ -226,6 +226,10 @@
     0% { background-position: -200% 0; }
     100% { background-position: 200% 0; }
   }
+  @keyframes progress-shine {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
   @keyframes ticker {
     0% { transform: translateY(0); }
     100% { transform: translateY(-50%); }
@@ -386,6 +390,10 @@
     background-clip: text;
     color: transparent;
     animation: shimmer-x 4s linear infinite;
+  }
+
+  .progress-glow {
+    box-shadow: 0 0 18px rgba(236, 72, 153, 0.24);
   }
 
   @media (prefers-reduced-motion: reduce) {

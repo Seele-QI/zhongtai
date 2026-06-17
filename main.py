@@ -3,16 +3,19 @@ import re
 import base64
 import tempfile
 import logging
+import asyncio
+import time
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lib.runninghub_client import RunningHubClient, RunningHubError, build_motion_prompt, build_cover_prompt
-from lib.video_postprocess import run_ffmpeg_post_process
+from lib.video_postprocess import run_ffmpeg_post_process, run_ffmpeg_post_process_from_base64
 
 from lib.auth import (
     SESSION_COOKIE, consume_email_token, create_session, destroy_session,
@@ -27,6 +30,9 @@ load_dotenv()
 
 # 说明：前端「爆改 / 智能体」已改为 Next 直连 DeepSeek；本服务可选（pnpm dev:all 或单独部署时保留）。
 app = FastAPI()
+POST_PROCESS_ROOT = os.path.join(tempfile.gettempdir(), "video-postprocess-public")
+os.makedirs(POST_PROCESS_ROOT, exist_ok=True)
+app.mount("/static/video-postprocess", StaticFiles(directory=POST_PROCESS_ROOT), name="video-postprocess")
 
 # 允许跨域（前端本地调试必须的配置）
 cors_allow_origins_raw = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
@@ -99,6 +105,35 @@ class CoverGenerateRequest(BaseModel):
 
 class CancelVideoTaskRequest(BaseModel):
     task_id: str
+
+
+class ManualEditRequest(BaseModel):
+    video_base64: str
+    script: str
+    business_card_text: str = ""
+    bgm_dir: str = ""
+
+
+class EditVideoRequest(BaseModel):
+    task_id: str = ""
+    video_url: str = ""
+    video_base64: str = ""
+    preset: str = "smooth"
+    subtitle_text: str = ""
+    business_card_text: str = ""
+    bgm_dir: str = ""
+    source: str = "generated"
+
+
+class EditTaskStatusResponse(BaseModel):
+    edit_job_id: str
+    task_id: str = ""
+    status: str
+    progress: int = 0
+    preset: str = "smooth"
+    source: str = "generated"
+    output_video_url: str = ""
+    error: str = ""
 
 
 def _require_deepseek_key() -> None:
@@ -243,6 +278,8 @@ async def agent_chat(req: AgentRequest):
 # 内存存储任务状态（生产环境应替换为数据库）
 _task_store: dict[str, dict] = {}
 _poll_tasks: dict[str, object] = {}
+_edit_task_store: dict[str, dict] = {}
+_edit_tasks: dict[str, object] = {}
 
 
 def _get_rh_client() -> "RunningHubClient":
@@ -274,6 +311,19 @@ def _cleanup_temp(*paths: str):
             os.unlink(p)
         except OSError:
             pass
+
+
+def _new_edit_job_id() -> str:
+    return f"edit_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+
+
+def _preset_to_bgm_dir(req_bgm_dir: str, preset: str) -> str | None:
+    if req_bgm_dir.strip():
+        return req_bgm_dir.strip()
+    if preset in {"dynamic", "cinematic", "broll"}:
+        env_dir = (os.getenv("VIDEO_BGM_DIR") or "").strip()
+        return env_dir or None
+    return None
 
 
 # ── POST /api/video/generate ──────────────────────────────────
@@ -331,6 +381,7 @@ async def video_generate(req: VideoGenerateRequest):
             "post_progress": 0,
             "post_error": "",
             "audio_url": audio_clone_url,
+            "script": req.script,
             "image_url": image_url,       # 用于封面图生成
             "gender": req.gender,          # 用于封面图 prompt
             "cover_url": "",               # 封面图 URL（异步填充）
@@ -462,8 +513,14 @@ async def _poll_video_task(task_id: str):
             "estimated_minutes": 0,
         }
         if video_url:
-            import asyncio as _asyncio
-            _asyncio.create_task(_run_post_process(task_id, video_url))
+            _task_store[task_id] = {
+                **_task_store.get(task_id, {}),
+                "status": "post_processing",
+                "post_stage": "running",
+                "post_progress": 5,
+                "post_error": "",
+            }
+            asyncio.create_task(_run_post_process(task_id, video_url))
 
         image_url = stored.get("image_url", "")
         gender = stored.get("gender", "female")
@@ -587,6 +644,131 @@ async def video_status(taskId: str):
 
 
 # ── POST /api/video/cover ────────────────────────────────────
+
+
+async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
+    stored = _edit_task_store.get(edit_job_id, {})
+    task_id = req.task_id or edit_job_id
+    output_dir = os.path.join(POST_PROCESS_ROOT, task_id, edit_job_id)
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        _edit_task_store[edit_job_id] = {
+            **stored,
+            "edit_job_id": edit_job_id,
+            "task_id": task_id,
+            "status": "running",
+            "progress": 15,
+            "preset": req.preset,
+            "source": req.source,
+            "output_video_url": "",
+            "error": "",
+        }
+        bgm_dir = _preset_to_bgm_dir(req.bgm_dir, req.preset)
+        business_card_text = req.business_card_text if req.preset in {"cinematic", "broll"} else ""
+        if req.video_base64.strip():
+            result = await asyncio.to_thread(
+                run_ffmpeg_post_process_from_base64,
+                task_id,
+                req.video_base64,
+                output_dir,
+                req.subtitle_text,
+                business_card_text,
+                bgm_dir,
+                req.preset,
+            )
+        else:
+            input_path = os.path.join(output_dir, "input.mp4")
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.get(req.video_url)
+                resp.raise_for_status()
+                with open(input_path, "wb") as f:
+                    f.write(resp.content)
+            _edit_task_store[edit_job_id]["progress"] = 35
+            result = await asyncio.to_thread(
+                run_ffmpeg_post_process,
+                task_id,
+                input_path,
+                output_dir,
+                req.subtitle_text,
+                True,
+                business_card_text,
+                bgm_dir,
+                req.preset,
+            )
+        if result.ok and result.output_path:
+            rel_path = os.path.relpath(result.output_path, POST_PROCESS_ROOT).replace(os.sep, "/")
+            public_url = f"/static/video-postprocess/{rel_path}"
+            _edit_task_store[edit_job_id] = {
+                **_edit_task_store.get(edit_job_id, {}),
+                "status": "success",
+                "progress": 100,
+                "output_video_url": public_url,
+                "error": "",
+            }
+            return
+        _edit_task_store[edit_job_id] = {
+            **_edit_task_store.get(edit_job_id, {}),
+            "status": "failed",
+            "progress": 0,
+            "output_video_url": "",
+            "error": result.error or "剪辑失败",
+        }
+    except Exception as e:
+        _edit_task_store[edit_job_id] = {
+            **_edit_task_store.get(edit_job_id, {}),
+            "status": "failed",
+            "progress": 0,
+            "output_video_url": "",
+            "error": str(e),
+        }
+
+
+@app.post("/api/video/edit", response_model=EditTaskStatusResponse)
+async def video_edit(req: EditVideoRequest):
+    if not req.subtitle_text.strip():
+        raise HTTPException(status_code=400, detail="缺少必填参数: subtitle_text")
+    if not req.video_url.strip() and not req.video_base64.strip():
+        raise HTTPException(status_code=400, detail="缺少必填参数: video_url 或 video_base64")
+
+    edit_job_id = _new_edit_job_id()
+    task_id = req.task_id or edit_job_id
+    _edit_task_store[edit_job_id] = {
+        "edit_job_id": edit_job_id,
+        "task_id": task_id,
+        "status": "queued",
+        "progress": 0,
+        "preset": req.preset,
+        "source": req.source,
+        "output_video_url": "",
+        "error": "",
+    }
+    edit_task = asyncio.create_task(_run_edit_job(edit_job_id, req))
+    _edit_tasks[edit_job_id] = edit_task
+    return EditTaskStatusResponse(**_edit_task_store[edit_job_id])
+
+
+@app.get("/api/video/edit/status", response_model=EditTaskStatusResponse)
+async def video_edit_status(editJobId: str):
+    if not editJobId:
+        raise HTTPException(status_code=400, detail="缺少 editJobId 参数")
+    stored = _edit_task_store.get(editJobId)
+    if not stored:
+        raise HTTPException(status_code=404, detail="剪辑任务不存在")
+    return EditTaskStatusResponse(**stored)
+
+
+@app.post("/api/video/manual-edit")
+async def video_manual_edit(req: ManualEditRequest):
+    return await video_edit(EditVideoRequest(
+        task_id="",
+        video_url="",
+        video_base64=req.video_base64,
+        preset="caption",
+        subtitle_text=req.script,
+        business_card_text=req.business_card_text,
+        bgm_dir=req.bgm_dir,
+        source="manual",
+    ))
 
 
 @app.post("/api/video/cover")
