@@ -8,7 +8,7 @@ import time
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,9 +18,10 @@ from lib.runninghub_client import RunningHubClient, RunningHubError, build_motio
 from lib.video_postprocess import run_ffmpeg_post_process, run_ffmpeg_post_process_from_base64
 
 from lib.auth import (
-    SESSION_COOKIE, consume_email_token, create_session, destroy_session,
+    SESSION_COOKIE, consume_email_token, create_password_user, create_session, destroy_session,
     get_current_user, get_or_create_user_by_hash, hash_email, mask_email,
-    save_email_token, generate_token,
+    normalize_login_name, save_email_token, generate_token, validate_login_name,
+    validate_password, verify_password_login,
 )
 from lib.credit import get_account, list_ledger
 from lib.rate_limit import check_ip, check_email
@@ -31,7 +32,9 @@ load_dotenv()
 # 说明：前端「爆改 / 智能体」已改为 Next 直连 DeepSeek；本服务可选（pnpm dev:all 或单独部署时保留）。
 app = FastAPI()
 POST_PROCESS_ROOT = os.path.join(tempfile.gettempdir(), "video-postprocess-public")
+MANUAL_UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "video-manual-uploads")
 os.makedirs(POST_PROCESS_ROOT, exist_ok=True)
+os.makedirs(MANUAL_UPLOAD_ROOT, exist_ok=True)
 app.mount("/static/video-postprocess", StaticFiles(directory=POST_PROCESS_ROOT), name="video-postprocess")
 
 # 允许跨域（前端本地调试必须的配置）
@@ -108,20 +111,23 @@ class CancelVideoTaskRequest(BaseModel):
 
 
 class ManualEditRequest(BaseModel):
-    video_base64: str
+    upload_id: str
     script: str
     business_card_text: str = ""
     bgm_dir: str = ""
+    bgm_volume: float = 0.32
 
 
 class EditVideoRequest(BaseModel):
     task_id: str = ""
     video_url: str = ""
+    upload_id: str = ""
     video_base64: str = ""
     preset: str = "smooth"
     subtitle_text: str = ""
     business_card_text: str = ""
     bgm_dir: str = ""
+    bgm_volume: float = 0.32
     source: str = "generated"
 
 
@@ -134,6 +140,13 @@ class EditTaskStatusResponse(BaseModel):
     source: str = "generated"
     output_video_url: str = ""
     error: str = ""
+
+
+class ManualUploadResponse(BaseModel):
+    upload_id: str
+    file_url: str = ""
+    original_name: str = ""
+    size: int = 0
 
 
 def _require_deepseek_key() -> None:
@@ -280,6 +293,7 @@ _task_store: dict[str, dict] = {}
 _poll_tasks: dict[str, object] = {}
 _edit_task_store: dict[str, dict] = {}
 _edit_tasks: dict[str, object] = {}
+_manual_upload_store: dict[str, dict] = {}
 
 
 def _get_rh_client() -> "RunningHubClient":
@@ -324,6 +338,20 @@ def _preset_to_bgm_dir(req_bgm_dir: str, preset: str) -> str | None:
         env_dir = (os.getenv("VIDEO_BGM_DIR") or "").strip()
         return env_dir or None
     return None
+
+
+def _new_manual_upload_id() -> str:
+    return f"upload_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+
+
+def _resolve_manual_upload_path(upload_id: str) -> str:
+    stored = _manual_upload_store.get(upload_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="上传文件不存在或已失效")
+    path = stored.get("path", "")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="上传文件不存在或已失效")
+    return path
 
 
 # ── POST /api/video/generate ──────────────────────────────────
@@ -646,6 +674,42 @@ async def video_status(taskId: str):
 # ── POST /api/video/cover ────────────────────────────────────
 
 
+@app.post("/api/video/manual-upload", response_model=ManualUploadResponse)
+async def video_manual_upload(file: UploadFile = File(...)):
+    filename = (file.filename or "upload.mp4").strip() or "upload.mp4"
+    content_type = (file.content_type or "").lower()
+    if not (content_type.startswith("video/") or filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"))):
+        raise HTTPException(status_code=400, detail="仅支持视频文件上传")
+
+    upload_id = _new_manual_upload_id()
+    ext = os.path.splitext(filename)[1] or ".mp4"
+    upload_dir = os.path.join(MANUAL_UPLOAD_ROOT, upload_id)
+    os.makedirs(upload_dir, exist_ok=True)
+    stored_path = os.path.join(upload_dir, f"source{ext}")
+    size = 0
+    try:
+        with open(stored_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 2 * 1024 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="视频文件请控制在 2GB 以内")
+                out.write(chunk)
+    finally:
+        await file.close()
+
+    _manual_upload_store[upload_id] = {
+        "upload_id": upload_id,
+        "path": stored_path,
+        "original_name": filename,
+        "size": size,
+        "created_at": int(time.time()),
+    }
+    return ManualUploadResponse(upload_id=upload_id, file_url="", original_name=filename, size=size)
+
+
 async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
     stored = _edit_task_store.get(edit_job_id, {})
     task_id = req.task_id or edit_job_id
@@ -664,8 +728,24 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
             "error": "",
         }
         bgm_dir = _preset_to_bgm_dir(req.bgm_dir, req.preset)
-        business_card_text = req.business_card_text if req.preset in {"cinematic", "broll"} else ""
-        if req.video_base64.strip():
+        business_card_text = req.business_card_text if req.business_card_text.strip() else ""
+        bgm_volume = max(0.0, min(float(req.bgm_volume), 1.0))
+        if req.upload_id.strip():
+            input_path = _resolve_manual_upload_path(req.upload_id)
+            _edit_task_store[edit_job_id]["progress"] = 35
+            result = await asyncio.to_thread(
+                run_ffmpeg_post_process,
+                task_id,
+                input_path,
+                output_dir,
+                req.subtitle_text,
+                True,
+                business_card_text,
+                bgm_dir,
+                req.preset,
+                bgm_volume,
+            )
+        elif req.video_base64.strip():
             result = await asyncio.to_thread(
                 run_ffmpeg_post_process_from_base64,
                 task_id,
@@ -675,6 +755,7 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
                 business_card_text,
                 bgm_dir,
                 req.preset,
+                bgm_volume,
             )
         else:
             input_path = os.path.join(output_dir, "input.mp4")
@@ -694,6 +775,7 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
                 business_card_text,
                 bgm_dir,
                 req.preset,
+                bgm_volume,
             )
         if result.ok and result.output_path:
             rel_path = os.path.relpath(result.output_path, POST_PROCESS_ROOT).replace(os.sep, "/")
@@ -727,8 +809,8 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
 async def video_edit(req: EditVideoRequest):
     if not req.subtitle_text.strip():
         raise HTTPException(status_code=400, detail="缺少必填参数: subtitle_text")
-    if not req.video_url.strip() and not req.video_base64.strip():
-        raise HTTPException(status_code=400, detail="缺少必填参数: video_url 或 video_base64")
+    if not req.video_url.strip() and not req.video_base64.strip() and not req.upload_id.strip():
+        raise HTTPException(status_code=400, detail="缺少必填参数: video_url、upload_id 或 video_base64")
 
     edit_job_id = _new_edit_job_id()
     task_id = req.task_id or edit_job_id
@@ -762,11 +844,13 @@ async def video_manual_edit(req: ManualEditRequest):
     return await video_edit(EditVideoRequest(
         task_id="",
         video_url="",
-        video_base64=req.video_base64,
+        upload_id=req.upload_id,
+        video_base64="",
         preset="caption",
         subtitle_text=req.script,
         business_card_text=req.business_card_text,
         bgm_dir=req.bgm_dir,
+        bgm_volume=req.bgm_volume,
         source="manual",
     ))
 
@@ -1107,6 +1191,79 @@ class SendLinkRequest(BaseModel):
     email: str
 
 
+class RegisterRequest(BaseModel):
+    login_name: str
+    password: str
+    confirm_password: str
+
+
+class PasswordLoginRequest(BaseModel):
+    login_name: str
+    password: str
+
+
+@app.post("/api/auth/register")
+async def auth_register(req: RegisterRequest, request: Request, response: Response):
+    login_name = normalize_login_name(req.login_name)
+    password = req.password or ""
+    confirm_password = req.confirm_password or ""
+    login_name_error = validate_login_name(login_name)
+    if login_name_error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": login_name_error})
+    password_error = validate_password(password)
+    if password_error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": password_error})
+    if password != confirm_password:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "两次输入的密码不一致"})
+    try:
+        user_id = create_password_user(login_name, password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": "REGISTER_FAILED", "message": str(e)}) from e
+    ua = request.headers.get("user-agent", "")
+    sid = create_session(user_id, ua, ip)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=sid,
+        max_age=30 * 86400,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    acct = get_account(user_id)
+    return {"user": {"id": user_id, "login_name": login_name}, "balance": acct.balance}
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: PasswordLoginRequest, request: Request, response: Response):
+    login_name = normalize_login_name(req.login_name)
+    password = req.password or ""
+    login_name_error = validate_login_name(login_name)
+    if login_name_error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": login_name_error})
+    password_error = validate_password(password)
+    if password_error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": password_error})
+    ip = request.client.host if request.client else ""
+    user_id = verify_password_login(login_name, password, ip)
+    if not user_id:
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "账号或密码错误"})
+    ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else ""
+    sid = create_session(user_id, ua, ip)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=sid,
+        max_age=30 * 86400,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    acct = get_account(user_id)
+    return {"user": {"id": user_id, "login_name": login_name}, "balance": acct.balance}
+
+
 @app.post("/api/auth/send-link")
 async def auth_send_link(req: SendLinkRequest, request: Request):
     """发送登录链接。永远返回 ok=True，不告诉前端是限频了还是 email 错了。"""
@@ -1181,6 +1338,7 @@ async def auth_me(request: Request):
         "user": {
             "id": user.id,
             "email_masked": user.email_masked,
+            "login_name": user.login_name,
             "nickname": user.nickname,
         },
         "balance": acct.balance,

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+
 from lib.db import connect, transaction
 
 EMAIL_HASH_SALT = os.getenv("EMAIL_HASH_SALT", "")
@@ -22,6 +23,50 @@ SESSION_TTL_DAYS = int(os.getenv("CREDIT_SESSION_TTL_DAYS", "30"))
 EMAIL_TOKEN_TTL_S = int(os.getenv("CREDIT_EMAIL_TOKEN_TTL_SECONDS", "900"))
 
 SESSION_COOKIE = "session_id"
+
+
+def normalize_login_name(login_name: str) -> str:
+    normalized = login_name.strip().lower()
+    normalized = normalized.replace(" ", "")
+    if not normalized:
+        return ""
+    return normalized
+
+
+def validate_login_name(login_name: str) -> Optional[str]:
+    if len(login_name) < 3:
+        return "账号至少 3 位"
+    if len(login_name) > 32:
+        return "账号不能超过 32 位"
+    if not all(ch.isalnum() or ch in "._-@" for ch in login_name):
+        return "账号仅支持字母、数字和 . _ - @"
+    return None
+
+
+def validate_password(password: str) -> Optional[str]:
+    if len(password) < 8:
+        return "密码至少 8 位"
+    if len(password) > 64:
+        return "密码不能超过 64 位"
+    return None
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    salt_value = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt_value.encode("utf-8"),
+        210_000,
+    )
+    return digest.hex(), salt_value
+
+
+def verify_password(password: str, password_hash: str, salt: str | None = None) -> bool:
+    if not password_hash or not salt:
+        return False
+    digest, _ = hash_password(password, salt)
+    return hmac.compare_digest(digest, password_hash)
 
 
 def hash_email(email: str) -> str:
@@ -104,9 +149,11 @@ def get_or_create_user_by_hash(email_hash: str, email_masked: str) -> int:
                 "UPDATE users SET last_seen_at = ? WHERE id = ?", (now_ms, row["id"])
             )
             return int(row["id"])
+        base_login_name = normalize_login_name(email_masked)
+        login_name = base_login_name or f"user_{secrets.token_hex(4)}"
         cur = conn.execute(
-            "INSERT INTO users (email_hash, email_masked, status, created_at, last_seen_at) VALUES (?, ?, 'active', ?, ?)",
-            (email_hash, email_masked, now_ms, now_ms),
+            "INSERT INTO users (email_hash, email_masked, login_name, status, created_at, last_seen_at) VALUES (?, ?, ?, 'active', ?, ?)",
+            (email_hash, email_masked, login_name, now_ms, now_ms),
         )
         user_id = int(cur.lastrowid)
         conn.execute(
@@ -153,7 +200,99 @@ def destroy_session(sid: str) -> None:
 class CurrentUser:
     id: int
     email_masked: str
+    login_name: str
     nickname: Optional[str]
+
+
+def create_password_user(login_name: str, password: str) -> int:
+    login_name_norm = normalize_login_name(login_name)
+    if not login_name_norm:
+        raise ValueError("账号不能为空")
+    login_name_error = validate_login_name(login_name_norm)
+    if login_name_error:
+        raise ValueError(login_name_error)
+    password_error = validate_password(password or "")
+    if password_error:
+        raise ValueError(password_error)
+    password_hash, password_salt = hash_password(password)
+    email_hash = hash_email(f"{login_name_norm}@local")
+    now_ms = int(time.time() * 1000)
+    with transaction() as conn:
+        row = conn.execute("SELECT id FROM users WHERE login_name = ?", (login_name_norm,)).fetchone()
+        if row:
+            raise ValueError("账号已存在")
+        cur = conn.execute(
+            "INSERT INTO users (email_hash, email_masked, login_name, password_hash, password_salt, status, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+            (email_hash, login_name_norm, login_name_norm, password_hash, password_salt, now_ms, now_ms),
+        )
+        user_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO credit_accounts (user_id, balance, total_bonus, updated_at) VALUES (?, 0, 0, ?)",
+            (user_id, now_ms),
+        )
+        conn.execute(
+            "INSERT INTO credit_ledger (user_id, type, delta, balance_after, note, created_at) VALUES (?, 'register_bonus', ?, ?, '账号注册赠送', ?)",
+            (user_id, REGISTER_BONUS, REGISTER_BONUS, now_ms),
+        )
+        conn.execute(
+            "UPDATE credit_accounts SET balance = ?, total_bonus = ?, updated_at = ? WHERE user_id = ?",
+            (REGISTER_BONUS, REGISTER_BONUS, now_ms, user_id),
+        )
+        return user_id
+
+
+def record_login_attempt(login_name: str, ip: str, success: bool) -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO login_attempts (login_name, ip, success, created_at) VALUES (?, ?, ?, ?)",
+            (normalize_login_name(login_name), ip or "", 1 if success else 0, int(time.time() * 1000)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _login_rate_limited(login_name: str, ip: str) -> bool:
+    now_ms = int(time.time() * 1000)
+    since = now_ms - 10 * 60 * 1000
+    conn = connect()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE created_at >= ? AND login_name = ? AND success = 0",
+            (since, normalize_login_name(login_name)),
+        ).fetchone()[0]
+        by_ip = conn.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE created_at >= ? AND ip = ? AND success = 0",
+            (since, ip or ""),
+        ).fetchone()[0]
+        return int(total) >= 5 or int(by_ip) >= 10
+    finally:
+        conn.close()
+
+
+def verify_password_login(login_name: str, password: str, ip: str = "") -> Optional[int]:
+    login_name_norm = normalize_login_name(login_name)
+    if _login_rate_limited(login_name_norm, ip):
+        return None
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT id, password_hash, password_salt, status FROM users WHERE login_name = ?", (login_name_norm,)
+        ).fetchone()
+        if not row or row["status"] != "active":
+            record_login_attempt(login_name_norm, ip, False)
+            return None
+        if not verify_password(password, row["password_hash"], row["password_salt"]):
+            record_login_attempt(login_name_norm, ip, False)
+            return None
+        now_ms = int(time.time() * 1000)
+        conn.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", (now_ms, row["id"]))
+        conn.commit()
+        record_login_attempt(login_name_norm, ip, True)
+        return int(row["id"])
+    finally:
+        conn.close()
 
 
 def get_current_user(request) -> Optional[CurrentUser]:
@@ -164,7 +303,7 @@ def get_current_user(request) -> Optional[CurrentUser]:
     conn = connect()
     try:
         row = conn.execute(
-            """SELECT s.user_id, s.expires_at, u.email_masked, u.nickname, u.status
+            """SELECT s.user_id, s.expires_at, u.email_masked, u.login_name, u.nickname, u.status
                FROM sessions s JOIN users u ON u.id = s.user_id
                WHERE s.id = ?""",
             (sid,),
@@ -182,6 +321,7 @@ def get_current_user(request) -> Optional[CurrentUser]:
         return CurrentUser(
             id=int(row["user_id"]),
             email_masked=row["email_masked"],
+            login_name=row["login_name"],
             nickname=row["nickname"],
         )
     finally:

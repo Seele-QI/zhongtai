@@ -26,6 +26,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email_hash TEXT UNIQUE NOT NULL,
                 email_masked TEXT NOT NULL,
+                login_name TEXT UNIQUE NOT NULL DEFAULT '',
+                password_hash TEXT NOT NULL DEFAULT '',
+                password_salt TEXT NOT NULL DEFAULT '',
                 nickname TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at INTEGER NOT NULL,
@@ -35,6 +38,12 @@ def migrate(conn: sqlite3.Connection) -> None:
     elif _column_exists(conn, "users", "phone_hash"):
         conn.execute("ALTER TABLE users RENAME COLUMN phone_hash TO email_hash")
         conn.execute("ALTER TABLE users RENAME COLUMN phone_masked TO email_masked")
+    if not _column_exists(conn, "users", "login_name"):
+        conn.execute("ALTER TABLE users ADD COLUMN login_name TEXT NOT NULL DEFAULT ''")
+    if not _column_exists(conn, "users", "password_hash"):
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
+    if not _column_exists(conn, "users", "password_salt"):
+        conn.execute("ALTER TABLE users ADD COLUMN password_salt TEXT NOT NULL DEFAULT ''")
 
     # sessions / credit_accounts / credit_ledger: 不变（幂等）
     conn.executescript("""
@@ -48,6 +57,16 @@ def migrate(conn: sqlite3.Connection) -> None:
             ip_first TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            login_name TEXT NOT NULL,
+            ip TEXT NOT NULL DEFAULT '',
+            success INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_name_time ON login_attempts(login_name, created_at);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts(ip, created_at);
 
         CREATE TABLE IF NOT EXISTS credit_accounts (
             user_id INTEGER PRIMARY KEY REFERENCES users(id),

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
-import { LogOut, LogIn, ChevronUp, Coins, Loader2, Mail } from "lucide-react"
+import { LogOut, LogIn, ChevronUp, Coins, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -16,19 +16,18 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 
-type Me = { user: { id: number; email_masked: string }; balance: number } | null
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+type Me = { user: { id: number; email_masked: string; login_name?: string }; balance: number } | null
 
 export function UserMenu() {
   const router = useRouter()
   const [me, setMe] = useState<Me | undefined>(undefined)
   const [openLogin, setOpenLogin] = useState(false)
   const [openMenu, setOpenMenu] = useState(false)
-  const [email, setEmail] = useState("")
+  const [tab, setTab] = useState<"login" | "register">("login")
+  const [loginName, setLoginName] = useState("")
+  const [password, setPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
   const [sending, setSending] = useState(false)
-  const [sent, setSent] = useState(false)
-  const [cooldown, setCooldown] = useState(0)
 
   const refresh = async () => {
     try {
@@ -49,11 +48,6 @@ export function UserMenu() {
     void refresh()
   }, [])
 
-  useEffect(() => {
-    if (cooldown <= 0) return
-    const t = setTimeout(() => setCooldown((c) => c - 1), 1000)
-    return () => clearTimeout(t)
-  }, [cooldown])
 
   useEffect(() => {
     if (!openMenu) return
@@ -65,28 +59,55 @@ export function UserMenu() {
     return () => document.removeEventListener("click", close)
   }, [openMenu])
 
-  const sendLink = async () => {
-    if (!EMAIL_RE.test(email)) {
-      toast.error("请输入有效邮箱地址")
+  const submitAuth = async () => {
+    const normalizedLoginName = loginName.trim().toLowerCase().replaceAll(" ", "")
+    if (normalizedLoginName.length < 3) {
+      toast.error("账号至少 3 位")
+      return
+    }
+    if (normalizedLoginName.length > 32) {
+      toast.error("账号不能超过 32 位")
+      return
+    }
+    if (!/^[a-zA-Z0-9._\-@]+$/.test(normalizedLoginName)) {
+      toast.error("账号仅支持字母、数字和 . _ - @")
+      return
+    }
+    if (password.length < 8) {
+      toast.error("密码至少 8 位")
+      return
+    }
+    if (password.length > 64) {
+      toast.error("密码不能超过 64 位")
+      return
+    }
+    if (tab === "register" && password !== confirmPassword) {
+      toast.error("两次输入的密码不一致")
       return
     }
     setSending(true)
     try {
-      const r = await fetch("/api/auth/send-link", {
+      const path = tab === "register" ? "/api/auth/register" : "/api/auth/login"
+      const body = tab === "register"
+        ? { login_name: normalizedLoginName, password, confirm_password: confirmPassword }
+        : { login_name: normalizedLoginName, password }
+      const r = await fetch(path, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify(body),
         credentials: "include",
       })
-      if (r.ok) {
-        setSent(true)
-        setCooldown(60)
-        toast.success("登录链接已发送到你的邮箱")
-      } else {
-        toast.error("发送失败，请稍后再试")
-      }
-    } catch {
-      toast.error("网络错误")
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data?.detail?.message || data?.detail || "登录失败")
+      setMe((data as any) ?? null)
+      setOpenLogin(false)
+      setLoginName("")
+      setPassword("")
+      setConfirmPassword("")
+      toast.success(tab === "register" ? "注册成功" : "登录成功")
+      router.refresh()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "请求失败")
     } finally {
       setSending(false)
     }
@@ -134,57 +155,56 @@ export function UserMenu() {
           onOpenChange={(o) => {
             setOpenLogin(o)
             if (!o) {
-              setSent(false)
-              setEmail("")
-              setCooldown(0)
+              setLoginName("")
+              setPassword("")
+              setConfirmPassword("")
+              setTab("login")
             }
           }}
         >
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
-              <DialogTitle>邮箱登录</DialogTitle>
-              <DialogDescription>未注册账号登录后自动创建，并赠送 100 积分。</DialogDescription>
+              <DialogTitle>账号密码登录</DialogTitle>
+              <DialogDescription>先注册账号，再用账号密码登录；不需要验证码。</DialogDescription>
             </DialogHeader>
-            {sent ? (
-              <div className="space-y-3 py-4 text-center">
-                <Mail className="mx-auto h-10 w-10 text-primary" />
-                <p className="text-sm">
-                  登录链接已发送到 <span className="font-mono">{email}</span>
-                </p>
-                <p className="text-xs text-muted-foreground">15 分钟内有效。点击邮件中的链接即可登录。</p>
-                <Button variant="outline" size="sm" disabled={cooldown > 0} onClick={sendLink}>
-                  {cooldown > 0 ? `${cooldown}s 后重发` : "重新发送"}
-                </Button>
+            <div className="flex gap-2 rounded-xl bg-muted p-1">
+              <Button type="button" variant={tab === "login" ? "default" : "ghost"} className="flex-1" onClick={() => setTab("login")}>登录</Button>
+              <Button type="button" variant={tab === "register" ? "default" : "ghost"} className="flex-1" onClick={() => setTab("register")}>注册</Button>
+            </div>
+            <div className="space-y-4 py-3">
+              <div className="space-y-2">
+                <Label htmlFor="um-login">账号</Label>
+                <Input id="um-login" placeholder="建议使用手机号/邮箱前缀/英文账号" value={loginName} onChange={(e) => setLoginName(e.target.value)} />
               </div>
-            ) : (
-              <>
-                <div className="space-y-4 py-2">
-                  <div className="space-y-2">
-                    <Label htmlFor="um-email">邮箱</Label>
-                    <Input
-                      id="um-email"
-                      type="email"
-                      placeholder="you@example.com"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                    />
-                  </div>
+              <div className="space-y-2">
+                <Label htmlFor="um-password">密码</Label>
+                <Input id="um-password" type="password" placeholder="至少 8 位" value={password} onChange={(e) => setPassword(e.target.value)} />
+              </div>
+              {tab === "register" && (
+                <div className="space-y-2">
+                  <Label htmlFor="um-confirm-password">确认密码</Label>
+                  <Input id="um-confirm-password" type="password" placeholder="再次输入密码" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
                 </div>
-                <DialogFooter>
-                  <Button onClick={sendLink} disabled={sending}>
-                    {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : "发送登录链接"}
-                  </Button>
-                </DialogFooter>
-              </>
-            )}
+              )}
+              {tab === "register" ? (
+                <p className="text-xs text-muted-foreground">注册成功后会自动登录，并为新账号创建独立积分账户。</p>
+              ) : (
+                <p className="text-xs text-muted-foreground">输入已注册账号与密码登录。</p>
+              )}
+            </div>
+            <DialogFooter>
+              <Button onClick={submitAuth} disabled={sending}>
+                {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : tab === "register" ? "注册并登录" : "登录"}
+              </Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       </>
     )
   }
 
-  // 已登录：邮箱 @ 前 1 + 末 1 做头像
-  const local = me.user.email_masked.split("@")[0]
+  const displayName = me.user.login_name || me.user.email_masked
+  const local = displayName.split("@")[0]
   const avatar = (local[0] || "?") + (local.slice(-1) || "")
   return (
     <div className="m-3" data-user-menu>
@@ -197,7 +217,7 @@ export function UserMenu() {
           {avatar.toUpperCase()}
         </div>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-foreground">{me.user.email_masked}</p>
+          <p className="truncate text-sm font-medium text-foreground">{me.user.login_name || me.user.email_masked}</p>
           <p className="flex items-center gap-1 truncate text-[11px] text-muted-foreground">
             <Coins className="h-3 w-3 text-amber-500" />
             <span className="tabular-nums">{me.balance}</span>
