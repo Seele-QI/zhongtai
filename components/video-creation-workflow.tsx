@@ -450,6 +450,30 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     toast({ title: "已停止生成", description: "中断任务不会返还积分。", variant: "destructive" })
   }, [failTask])
 
+  const handleReturnFromLocalPreview = React.useCallback(() => {
+    updateTask({
+      status: "pending",
+      currentStage: "idle",
+      taskId: "",
+      isProcessing: false,
+      isEditing: false,
+      errorMessage: "",
+      editingErrorMessage: "",
+      progress: 0,
+      videoUrl: "",
+      coverUrl: "",
+      selectedPreset: "",
+      resumeGraceUntil: 0,
+      pollErrorCount: 0,
+      lastPollError: "",
+      lastHeartbeat: 0,
+      lastStatusAt: 0,
+      videoStageStartedAt: 0,
+      stageProgress: { voiceClone: 0, videoGen: 0, editing: 0 },
+    })
+    toast({ title: "已返回素材准备", description: "已保留图片、音频和文案，可直接重新生成。" })
+  }, [updateTask])
+
   /** Background poll — survives component re-render (when user switches sidebar tabs) */
   const startBackgroundPoll = React.useCallback((tid: string) => {
     stopBackgroundPoll()
@@ -1333,6 +1357,11 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 />
                 <div className="border-t border-slate-100 px-4 py-3 text-[12px] text-slate-500 dark:border-white/5 dark:text-slate-400">
                   当前为本地预览模式，仅用于验证界面与预设选择，不会请求后端剪辑。
+                  <div className="mt-3">
+                    <Button variant="outline" size="sm" onClick={handleReturnFromLocalPreview}>
+                      返回素材准备
+                    </Button>
+                  </div>
                 </div>
               </div>
             )}

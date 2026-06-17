@@ -17,3 +17,8 @@ node_modules
 .DS_Store
 __pycache__/
 tests/__pycache__/
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3

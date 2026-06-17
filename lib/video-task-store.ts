@@ -162,6 +162,32 @@ export function loadTask(): VideoTaskState | null {
       }
     }
 
+    // 仅拿到 taskId 后才有可恢复的后端轮询任务。
+    // 若刷新/重新进入页面时仍处于"处理中"但没有 taskId，前端已无法继续等待原请求，
+    // 继续恢复只会造成假性"生成中"卡住，因此直接转为失败态并保留素材供用户重试。
+    if (parsed.isProcessing === true && !parsed.taskId) {
+      return {
+        ...DEFAULT_STATE,
+        ...parsed,
+        taskId: "",
+        status: "failed",
+        currentStage: "failed",
+        isProcessing: false,
+        progress: 0,
+        stageProgress: { ...DEFAULT_PROGRESS },
+        lastHeartbeat: 0,
+        lastStatusAt: 0,
+        videoStageStartedAt: 0,
+        resumeGraceUntil: 0,
+        pollErrorCount: 0,
+        lastPollError: "",
+        videoUrl: "",
+        coverUrl: "",
+        updatedAt: now,
+        errorMessage: "检测到上次生成停留在提交阶段且未返回 taskId，当前页面无法恢复该任务，请重新生成。",
+      }
+    }
+
     return {
       ...DEFAULT_STATE,
       ...parsed,
