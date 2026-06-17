@@ -519,16 +519,67 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           if (s === "success") {
             const vUrl = sd.video_url || sd.videoUrl || ""
             const cUrl = sd.cover_url || sd.coverUrl || ""
+            const postUrl = sd.post_video_url || sd.postVideoUrl || ""
+            const postStage = (sd.post_stage || sd.postStage || "").toLowerCase()
+            const postProgress = typeof sd.post_progress === "number" ? sd.post_progress : (typeof sd.postProgress === "number" ? sd.postProgress : 0)
             const nextStageProgress = { voiceClone: 100, videoGen: 100, editing: 0 }
 
-            // 视频已就绪但封面图尚未生成 — 继续轻量轮询等待封面（间隔 10s，最多额外等 120s）
+            if (postStage === "running" || s === "post_processing") {
+              updateTask({
+                status: "post_processing",
+                currentStage: "editing",
+                isProcessing: true,
+                errorMessage: "",
+                editingErrorMessage: "",
+                videoUrl: vUrl,
+                coverUrl: cUrl,
+                postProcessingStage: "running",
+                postProcessingProgress: postProgress || 30,
+                postProcessingErrorMessage: "",
+                progress: 100,
+                stageProgress: nextStageProgress,
+                lastStatusAt: now,
+              })
+              return
+            }
+
+            if (postStage === "published" || (s === "published" && postUrl)) {
+              shouldScheduleNext = false
+              stopBackgroundPoll()
+              updateTask({
+                status: "published",
+                currentStage: "done",
+                isProcessing: false,
+                errorMessage: "",
+                editingErrorMessage: "",
+                videoUrl: vUrl,
+                coverUrl: cUrl,
+                postProcessingStage: "published",
+                postProcessingProgress: 100,
+                postProcessingErrorMessage: "",
+                progress: 100,
+                stageProgress: nextStageProgress,
+                lastStatusAt: now,
+              })
+              addHistoryRecord({
+                id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
+                videoUrl: postUrl || vUrl, coverUrl: cUrl, gender: genderRef.current, status: "success",
+              })
+              if (postUrl || vUrl) {
+                addShareVideo({
+                  id: tid, title: scriptRef.current.trim().slice(0, 30),
+                  url: postUrl || vUrl, thumbnail: cUrl || undefined, source: "video-creation", createdAt: Date.now(),
+                })
+              }
+              return
+            }
+
             if (vUrl && !cUrl) {
               if (coverWaitStartRef.current === 0) {
                 coverWaitStartRef.current = Date.now()
               }
               const coverElapsed = Date.now() - coverWaitStartRef.current
               if (coverElapsed > 120_000) {
-                // 封面超时 — 保留视频，停止轮询，不做失败态
                 coverWaitStartRef.current = 0
                 shouldScheduleNext = false
                 stopBackgroundPoll()
@@ -544,18 +595,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   stageProgress: nextStageProgress,
                   lastStatusAt: now,
                 })
-                addHistoryRecord({
-                  id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
-                  videoUrl: vUrl, coverUrl: "", gender: genderRef.current, status: "success",
-                })
-                if (vUrl) {
-                  addShareVideo({
-                    id: tid, title: scriptRef.current.trim().slice(0, 30),
-                    url: vUrl, thumbnail: undefined, source: "video-creation", createdAt: Date.now(),
-                  })
-                }
               } else {
-                // 更新 videoUrl 让用户可见，但继续轮询封面
                 updateTask({
                   status: "polling",
                   currentStage: "video",
@@ -570,7 +610,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 })
               }
             } else {
-              // 封面已就绪或无视频 — 正常完成
               coverWaitStartRef.current = 0
               shouldScheduleNext = false
               stopBackgroundPoll()
@@ -580,23 +619,30 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 isProcessing: false,
                 errorMessage: "",
                 editingErrorMessage: "",
-                videoUrl: vUrl,
+                videoUrl: postUrl || vUrl,
                 coverUrl: cUrl,
+                postProcessingStage: postStage === "failed" ? "failed" : "",
+                postProcessingProgress: postStage === "failed" ? 0 : 100,
+                postProcessingErrorMessage: sd.post_error || sd.postError || "",
                 progress: 100,
                 stageProgress: nextStageProgress,
                 lastStatusAt: now,
               })
-              addHistoryRecord({
-                id: tid, createdAt: Date.now(), script: scriptRef.current.trim(),
-                videoUrl: vUrl, coverUrl: cUrl, gender: genderRef.current, status: "success",
-              })
-              if (vUrl) {
-                addShareVideo({
-                  id: tid, title: scriptRef.current.trim().slice(0, 30),
-                  url: vUrl, thumbnail: cUrl || undefined, source: "video-creation", createdAt: Date.now(),
-                })
-              }
             }
+          } else if (s === "post_failed") {
+            shouldScheduleNext = false
+            const postErr = sd.post_error || sd.postError || "后处理失败"
+            updateTask({
+              status: "post_failed",
+              currentStage: "done",
+              isProcessing: false,
+              postProcessingStage: "failed",
+              postProcessingProgress: 0,
+              postProcessingErrorMessage: postErr,
+              videoUrl: sd.video_url || sd.videoUrl || "",
+              coverUrl: sd.cover_url || sd.coverUrl || "",
+              errorMessage: "",
+            })
           } else if (s === "failed") {
             shouldScheduleNext = false
             const errMsg = sd.error || sd.detail || "生成失败"

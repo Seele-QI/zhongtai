@@ -18,6 +18,7 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING
 )
 
 REM 设置 NODE_OPTIONS 以修复 Windows 上可能的 EXDEV 文件系统错误
+if /i "%AGENTHUB_CLEAN_CACHE%"=="1" call pnpm clean:cache
 set NODE_OPTIONS=--import ./scripts/dev-fix.mjs
 
 REM 同时启动前端 + Python 后端

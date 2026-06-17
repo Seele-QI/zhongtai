@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from lib.runninghub_client import RunningHubClient, RunningHubError, build_motion_prompt, build_cover_prompt
+from lib.video_postprocess import run_ffmpeg_post_process
 
 from lib.auth import (
     SESSION_COOKIE, consume_email_token, create_session, destroy_session,
@@ -82,6 +83,10 @@ class TaskStatusResponse(BaseModel):
     video_url: str = ""
     audio_url: str = ""
     cover_url: str = ""
+    post_video_url: str = ""
+    post_stage: str = ""
+    post_progress: int = 0
+    post_error: str = ""
     error: str = ""
     estimated_minutes: int = 30
 
@@ -321,6 +326,10 @@ async def video_generate(req: VideoGenerateRequest):
             "status": "queued",
             "progress": 0,
             "video_url": "",
+            "post_video_url": "",
+            "post_stage": "",
+            "post_progress": 0,
+            "post_error": "",
             "audio_url": audio_clone_url,
             "image_url": image_url,       # 用于封面图生成
             "gender": req.gender,          # 用于封面图 prompt
@@ -352,8 +361,88 @@ async def video_generate(req: VideoGenerateRequest):
         _cleanup_temp(*[p for p in [image_path, audio_path] if p])
 
 
+async def _run_post_process(task_id: str, video_url: str):
+    stored = _task_store.get(task_id, {})
+    base_dir = os.path.join(tempfile.gettempdir(), "video-postprocess", task_id)
+    os.makedirs(base_dir, exist_ok=True)
+    input_path = os.path.join(base_dir, "input.mp4")
+    post_video_url = ""
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(video_url)
+            resp.raise_for_status()
+            with open(input_path, "wb") as f:
+                f.write(resp.content)
+        _task_store[task_id] = {
+            **stored,
+            "task_id": task_id,
+            "status": "post_processing",
+            "progress": 100,
+            "video_url": video_url,
+            "post_stage": "running",
+            "post_progress": 10,
+            "post_error": "",
+            "error": "",
+            "estimated_minutes": 0,
+        }
+        result = await asyncio.to_thread(
+            run_ffmpeg_post_process,
+            task_id,
+            input_path,
+            base_dir,
+            stored.get("script", ""),
+            True,
+        )
+        if result.ok and result.output_path:
+            post_video_url = result.output_path
+            _task_store[task_id] = {
+                **stored,
+                "task_id": task_id,
+                "status": "published",
+                "progress": 100,
+                "video_url": video_url,
+                "post_video_url": post_video_url,
+                "post_stage": "published",
+                "post_progress": 100,
+                "post_error": "",
+                "error": "",
+                "estimated_minutes": 0,
+            }
+        else:
+            _task_store[task_id] = {
+                **stored,
+                "task_id": task_id,
+                "status": "post_failed",
+                "progress": 100,
+                "video_url": video_url,
+                "post_video_url": "",
+                "post_stage": "failed",
+                "post_progress": 0,
+                "post_error": result.error,
+                "error": "",
+                "estimated_minutes": 0,
+            }
+    except Exception as e:
+        _task_store[task_id] = {
+            **stored,
+            "task_id": task_id,
+            "status": "post_failed",
+            "progress": 100,
+            "video_url": video_url,
+            "post_video_url": "",
+            "post_stage": "failed",
+            "post_progress": 0,
+            "post_error": str(e),
+            "error": "",
+            "estimated_minutes": 0,
+        }
+    finally:
+        if post_video_url:
+            _task_store[task_id]["post_video_url"] = post_video_url
+
+
 async def _poll_video_task(task_id: str):
-    """后台轮询视频生成任务，完成后自动触发封面图生成"""
+    """后台轮询视频生成任务，完成后自动触发后处理与封面图生成"""
     import asyncio
     rh = _get_rh_client()
     stored = _task_store.get(task_id, {})
@@ -372,8 +461,10 @@ async def _poll_video_task(task_id: str):
             "error": "",
             "estimated_minutes": 0,
         }
+        if video_url:
+            import asyncio as _asyncio
+            _asyncio.create_task(_run_post_process(task_id, video_url))
 
-        # 自动触发封面图生成
         image_url = stored.get("image_url", "")
         gender = stored.get("gender", "female")
         if image_url and video_url:
@@ -478,11 +569,17 @@ async def video_status(taskId: str):
         if status == "SUCCESS":
             results = result.get("results", [])
             video_url = results[0].get("url", "") if results else ""
+        task_status = status.lower()
+        post_status = stored.get("post_stage", "") if stored else ""
         return TaskStatusResponse(
             task_id=taskId,
-            status=status.lower(),
+            status=task_status,
             progress=50 if status == "RUNNING" else 0,
             video_url=video_url,
+            post_video_url=stored.get("post_video_url", "") if stored else "",
+            post_stage=post_status,
+            post_progress=stored.get("post_progress", 0) if stored else 0,
+            post_error=stored.get("post_error", "") if stored else "",
             error=result.get("errorMessage", ""),
         )
     except RunningHubError as e:

@@ -14,9 +14,17 @@ next.user-config.*
 # Common ignores
 node_modules
 .next/
+.tmp/
+.pytest_cache/
+.turbo/
+.cache/
+.pnpm-store/
 .DS_Store
 __pycache__/
 tests/__pycache__/
+*.pyc
+*.log
+tsconfig.tsbuildinfo
 
 # Runtime data
 *.db

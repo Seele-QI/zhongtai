@@ -9,10 +9,10 @@
 
 const STORAGE_KEY = "video-creation-task"
 
-export type TaskStatus = "pending" | "scanning" | "polling" | "success" | "failed"
+export type TaskStatus = "pending" | "scanning" | "polling" | "post_processing" | "published" | "post_failed" | "success" | "failed"
 
 /** 当前执行阶段，用于刷新后恢复 */
-export type TaskStage = "idle" | "voice" | "video" | "editing" | "done" | "failed"
+export type TaskStage = "idle" | "voice" | "video" | "post" | "editing" | "done" | "failed"
 
 /** 分段进度，每段 0-100 */
 export type StageProgress = {
@@ -57,6 +57,9 @@ export type VideoTaskState = {
   selectedPreset: string
   isEditing: boolean
   editingErrorMessage: string
+  postProcessingStage: string
+  postProcessingProgress: number
+  postProcessingErrorMessage: string
   qrDataUrl: string
   shareUrl: string
   copied: boolean
@@ -109,6 +112,9 @@ const DEFAULT_STATE: Omit<VideoTaskState, "taskId" | "createdAt" | "updatedAt"> 
   selectedPreset: "",
   isEditing: false,
   editingErrorMessage: "",
+  postProcessingStage: "",
+  postProcessingProgress: 0,
+  postProcessingErrorMessage: "",
   qrDataUrl: "",
   shareUrl: "",
   copied: false,
