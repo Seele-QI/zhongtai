@@ -10,6 +10,11 @@ os.environ["CREDIT_REGISTER_BONUS"] = "100"
 os.environ["CREDIT_EMAIL_TOKEN_TTL_SECONDS"] = "900"
 
 from lib import auth  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+import main as main_module  # noqa: E402
+
+
+client = TestClient(main_module.app)
 
 
 def test_hash_email_deterministic():
@@ -105,3 +110,98 @@ def test_session_create_and_destroy():
         assert row is None
     finally:
         conn.close()
+
+
+def test_password_register_returns_email_masked_and_bonus_balance():
+    resp = client.post(
+        "/api/auth/register",
+        json={
+            "login_name": "alice_test",
+            "password": "Password123",
+            "confirm_password": "Password123",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["user"]["login_name"] == "alice_test"
+    assert data["user"]["email_masked"] == "alice_test"
+    assert data["balance"] == 100
+
+
+def test_password_login_returns_email_masked_and_balance():
+    created_user_id = auth.create_password_user("bob_test", "Password123")
+
+    resp = client.post(
+        "/api/auth/login",
+        json={
+            "login_name": "bob_test",
+            "password": "Password123",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["user"]["id"] == created_user_id
+    assert data["user"]["login_name"] == "bob_test"
+    assert data["user"]["email_masked"] == "bob_test"
+    assert data["balance"] == 100
+
+
+def test_credit_consume_ai_chat_always_costs_3_points():
+    client.post(
+        "/api/auth/register",
+        json={
+            "login_name": "chat_cost_user",
+            "password": "Password123",
+            "confirm_password": "Password123",
+        },
+    )
+
+    resp = client.post(
+        "/api/credit/consume",
+        json={
+            "scene": "ai_chat",
+            "cost": 1,
+            "ref_id": "chat-1",
+            "note": "chat-1",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["scene"] == "ai_chat"
+    assert data["cost"] == 3
+    assert data["balance"] == 97
+
+
+def test_credit_consume_video_creation_always_costs_500_points():
+    from lib.credit import refund
+
+    user_id = auth.create_password_user("video_cost_user", "Password123")
+    refund(user_id, 1000, ref_id="topup", note="test topup")
+
+    login_resp = client.post(
+        "/api/auth/login",
+        json={
+            "login_name": "video_cost_user",
+            "password": "Password123",
+        },
+    )
+    assert login_resp.status_code == 200, login_resp.text
+
+    resp = client.post(
+        "/api/credit/consume",
+        json={
+            "scene": "video_creation",
+            "cost": 1,
+            "ref_id": "video-1",
+            "note": "video-1",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["scene"] == "video_creation"
+    assert data["cost"] == 500
+    assert data["balance"] == 600

@@ -21,7 +21,7 @@ export type TaskHealth = {
 
 export const POLL_ERROR_LIMIT = 3
 export const STATUS_STALE_MS = 60_000
-export const TASK_TIMEOUT_MS = 45 * 60_000
+export const TASK_TIMEOUT_MS = 60 * 60_000
 export const RESUME_POLL_GRACE_MS = 15_000
 export const WAIT_TASK_ID_MS = 12 * 60_000
 export const LEGACY_PROCESSING_GRACE_MS = 30_000
@@ -33,11 +33,40 @@ const DEFAULT_STEP_STATUSES: Record<WorkflowStepId, WorkflowStepStatus> = {
   4: "pending",
 }
 
+export function createGenerateSubmissionPatch(submittedAt: number): Partial<VideoTaskState> {
+  return {
+    status: "scanning",
+    currentStage: "voice",
+    lastHeartbeat: submittedAt,
+    submittedAt,
+    lastStatusAt: 0,
+    resumeGraceUntil: 0,
+    pollErrorCount: 0,
+    lastPollError: "",
+    taskId: "",
+    isProcessing: true,
+    errorMessage: "",
+    editingErrorMessage: "",
+    videoUrl: "",
+    coverUrl: "",
+    progress: 0,
+    videoStageStartedAt: 0,
+    postProcessingStage: "",
+    postProcessingProgress: 0,
+    postProcessingErrorMessage: "",
+    stageProgress: { voiceClone: 0, videoGen: 0, editing: 0 },
+  }
+}
+
 export function getTaskHealth(state: VideoTaskState, now = Date.now()): TaskHealth {
   const isVideoPollingStage = state.currentStage === "video" && state.isProcessing
   const isInResumeGrace = isVideoPollingStage && state.resumeGraceUntil > now
   const isLegacyProcessing = state.isProcessing && !state.taskId && state.currentStage === "idle"
   const isWaitingTaskId = state.isProcessing && !state.taskId && (state.currentStage === "voice" || isLegacyProcessing)
+  const isTimedVideoStage =
+    state.isProcessing &&
+    !!state.taskId &&
+    (state.currentStage === "video" || state.currentStage === "editing" || state.status === "polling" || state.status === "post_processing")
 
   const noStatusTooLong =
     isVideoPollingStage &&
@@ -56,7 +85,7 @@ export function getTaskHealth(state: VideoTaskState, now = Date.now()): TaskHeal
     now - state.submittedAt > LEGACY_PROCESSING_GRACE_MS
 
   const hardTimeout =
-    state.isProcessing &&
+    isTimedVideoStage &&
     state.videoStageStartedAt > 0 &&
     now - state.videoStageStartedAt > TASK_TIMEOUT_MS
 

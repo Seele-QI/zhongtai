@@ -18,6 +18,8 @@ import { AccountPositioning } from "@/components/account-positioning"
 import { SettingsView } from "@/components/settings-view"
 import { HelpCenterView } from "@/components/help-center-view"
 import { PlanRouteView } from "@/components/plan-route-view"
+import { CreditRechargeView } from "@/components/credit-recharge-view"
+import { AdminCreditView } from "@/components/admin-credit-view"
 import { BackToTop } from "@/components/back-to-top"
 import { TEAM_AGENTS, getTeamAgentByName } from "@/lib/team-agents"
 import {
@@ -117,6 +119,8 @@ function getBreadcrumb(view: MainView): { parent: string; current: string } {
       return { parent: "更多", current: "帮助中心" }
     case "规划路线":
       return { parent: "工作台", current: "规划路线" }
+    case "充值兑换":
+      return { parent: "积分系统", current: "充值兑换" }
     default:
       return { parent: "工作台", current: "智能体总览" }
   }
@@ -222,6 +226,14 @@ function ContentArea({
 
   if (activeView === "帮助中心") {
     return <HelpCenterView />
+  }
+
+  if (activeView === "充值兑换") {
+    return <CreditRechargeView />
+  }
+
+  if (activeView === "管理员后台") {
+    return <AdminCreditView />
   }
 
   // Default: dashboard

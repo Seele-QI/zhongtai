@@ -15,12 +15,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 
-type Me = { user: { id: number; email_masked: string }; balance: number } | null
+type Me = { user: { id: number; email_masked: string }; balance: number } | null | undefined
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export function CreditBadge() {
-  const [me, setMe] = useState<Me>(undefined as unknown as Me)
+  const [me, setMe] = useState<Me>(undefined)
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [email, setEmail] = useState("")

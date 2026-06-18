@@ -36,6 +36,7 @@ VIDEO_NODE_PROMPT = "254"  # TextInput_ — 11 行动作描述提示词
 
 # 封面图 API
 COVER_IMAGE_ENDPOINT = "/rhart-image-g-2/image-to-image"
+COVER_UPLOAD_ENDPOINT = "/media/upload/binary"
 
 # 轮询间隔（秒）
 POLL_INTERVAL = 5
@@ -110,6 +111,27 @@ class RunningHubClient:
             await self._client.aclose()
             self._client = None
 
+    def _extract_error_message(self, resp: httpx.Response) -> str:
+        """尽量透传 RunningHub 返回的业务错误信息。"""
+        try:
+            payload = resp.json()
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("errorMessage") or payload.get("message") or "").strip()
+
+    def _build_http_error(self, action: str, resp: httpx.Response) -> RunningHubError:
+        error_message = self._extract_error_message(resp)
+        message = f"{action}失败 (HTTP {resp.status_code})"
+        if error_message:
+            message = f"{message}: {error_message}"
+        return RunningHubError(
+            message,
+            status_code=resp.status_code,
+            response_body=(resp.text or "")[:1000],
+        )
+
     # ── 文件上传 ──────────────────────────────────────────
 
     async def upload_file(self, file_path: str) -> str:
@@ -137,11 +159,7 @@ class RunningHubClient:
             raise RunningHubError(f"文件上传网络错误: {e}") from e
 
         if not resp.is_success:
-            raise RunningHubError(
-                f"文件上传失败 (HTTP {resp.status_code})",
-                status_code=resp.status_code,
-                response_body=resp.text[:1000],
-            )
+            raise self._build_http_error("文件上传", resp)
 
         data = resp.json()
         download_url = data.get("data", {}).get("download_url", "")
@@ -207,11 +225,7 @@ class RunningHubClient:
             raise RunningHubError(f"音频克隆任务提交网络错误: {e}") from e
 
         if not resp.is_success:
-            raise RunningHubError(
-                f"音频克隆任务提交失败 (HTTP {resp.status_code})",
-                status_code=resp.status_code,
-                response_body=resp.text[:1000],
-            )
+            raise self._build_http_error("音频克隆任务提交", resp)
 
         data = resp.json()
         task_id = data.get("taskId", "")
@@ -275,11 +289,7 @@ class RunningHubClient:
             raise RunningHubError(f"视频生成任务提交网络错误: {e}") from e
 
         if not resp.is_success:
-            raise RunningHubError(
-                f"视频生成任务提交失败 (HTTP {resp.status_code})",
-                status_code=resp.status_code,
-                response_body=resp.text[:1000],
-            )
+            raise self._build_http_error("视频生成任务提交", resp)
 
         data = resp.json()
         task_id = data.get("taskId", "")
@@ -326,11 +336,7 @@ class RunningHubClient:
             raise RunningHubError(f"封面图生成任务提交网络错误: {e}") from e
 
         if not resp.is_success:
-            raise RunningHubError(
-                f"封面图生成任务提交失败 (HTTP {resp.status_code})",
-                status_code=resp.status_code,
-                response_body=resp.text[:1000],
-            )
+            raise self._build_http_error("封面图生成任务提交", resp)
 
         data = resp.json()
         task_id = data.get("taskId", "")

@@ -10,6 +10,7 @@
 const STORAGE_KEY = "video-creation-task"
 
 export type TaskStatus = "pending" | "scanning" | "polling" | "post_processing" | "published" | "post_failed" | "success" | "failed"
+export type CoverStatus = "idle" | "running" | "success" | "failed"
 
 /** 当前执行阶段，用于刷新后恢复 */
 export type TaskStage = "idle" | "voice" | "video" | "post" | "editing" | "done" | "failed"
@@ -41,6 +42,9 @@ export type VideoTaskState = {
   // 产出
   videoUrl: string
   coverUrl: string
+  coverStatus: CoverStatus
+  coverError: string
+  coverTaskId: string
 
   // 输入
   script: string
@@ -55,6 +59,8 @@ export type VideoTaskState = {
 
   // 剪辑
   selectedPreset: string
+  businessCardText: string
+  bgmVolume: number
   isEditing: boolean
   editingErrorMessage: string
   postProcessingStage: string
@@ -102,6 +108,9 @@ const DEFAULT_STATE: Omit<VideoTaskState, "taskId" | "createdAt" | "updatedAt"> 
   errorMessage: "",
   videoUrl: "",
   coverUrl: "",
+  coverStatus: "idle",
+  coverError: "",
+  coverTaskId: "",
   script: "",
   gender: "female",
   imageBase64: "",
@@ -110,6 +119,8 @@ const DEFAULT_STATE: Omit<VideoTaskState, "taskId" | "createdAt" | "updatedAt"> 
   audioName: "",
   audioDuration: "",
   selectedPreset: "",
+  businessCardText: "",
+  bgmVolume: 0.32,
   isEditing: false,
   editingErrorMessage: "",
   postProcessingStage: "",
@@ -202,6 +213,13 @@ export function loadTask(): VideoTaskState | null {
         ...(parsed.stageProgress ?? {}),
       },
       taskId: parsed.taskId ?? "",
+      coverStatus: parsed.coverStatus === "running" || parsed.coverStatus === "success" || parsed.coverStatus === "failed"
+        ? parsed.coverStatus
+        : "idle",
+      coverError: parsed.coverError ?? "",
+      coverTaskId: parsed.coverTaskId ?? "",
+      businessCardText: parsed.businessCardText ?? "",
+      bgmVolume: typeof parsed.bgmVolume === "number" ? parsed.bgmVolume : 0.32,
       createdAt: parsed.createdAt ?? now,
       updatedAt: parsed.updatedAt ?? now,
     }

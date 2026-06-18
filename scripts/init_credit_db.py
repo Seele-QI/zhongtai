@@ -88,6 +88,20 @@ def migrate(conn: sqlite3.Connection) -> None:
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_ledger_user_time ON credit_ledger(user_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS credit_redeem_codes (
+            code TEXT PRIMARY KEY,
+            amount INTEGER NOT NULL CHECK (amount > 0),
+            status TEXT NOT NULL DEFAULT 'active',
+            batch_id TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            created_by_user_id INTEGER REFERENCES users(id),
+            redeemed_by_user_id INTEGER REFERENCES users(id),
+            created_at INTEGER NOT NULL,
+            redeemed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_redeem_codes_status_amount ON credit_redeem_codes(status, amount);
+        CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON credit_redeem_codes(batch_id);
     """)
 
     # email_tokens: 处理 sms_codes 迁移 / 新建

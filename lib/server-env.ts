@@ -26,6 +26,10 @@ export function getDeepseekApiKey(): string {
   return readServerEnv("DEEPSEEK_API_KEY")
 }
 
+export function getAdminAccessKey(): string {
+  return readServerEnv("CREDIT_ADMIN_ACCESS_KEY")
+}
+
 /** 未配置密钥时返回给前端的说明（含本地与 Netlify 等线上场景） */
 export function deepseekApiKeyMissingUserMessage(): string {
   return (

@@ -19,16 +19,29 @@ class PostProcessResult:
 
 
 _PUNCTUATION_WEIGHTS = {
-    "，": 1.0,
-    "、": 1.0,
+    "，": 0.8,
+    "、": 0.6,
     "；": 1.0,
-    "。": 2.0,
-    "！": 2.0,
-    "？": 2.0,
-    "：": 1.5,
-    "—": 1.5,
-    "…": 1.5,
+    "。": 1.4,
+    "！": 1.4,
+    "？": 1.4,
+    "：": 0.8,
+    "—": 0.8,
+    "…": 1.2,
+    ",": 0.6,
+    ".": 1.0,
+    "!": 1.2,
+    "?": 1.2,
+    "/": 0.2,
 }
+
+_SUBTITLE_ALLOWED_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff\s]+")
+_SUBTITLE_BREAK_RE = re.compile(r"[，。！？；：、,.!?:;/\r\n]+")
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_LOCAL_FFMPEG_BIN = _PROJECT_ROOT / "tools" / "ffmpeg" / "bin"
+_FFMPEG_EXE = str(_LOCAL_FFMPEG_BIN / "ffmpeg.exe") if (_LOCAL_FFMPEG_BIN / "ffmpeg.exe").exists() else "ffmpeg"
+_FFPROBE_EXE = str(_LOCAL_FFMPEG_BIN / "ffprobe.exe") if (_LOCAL_FFMPEG_BIN / "ffprobe.exe").exists() else "ffprobe"
 
 
 def _escape_ass_text(text: str) -> str:
@@ -45,16 +58,35 @@ def _format_time(seconds: float) -> str:
 
 
 def _line_weight(line: str) -> float:
-    weight = 0.0
+    clean = _clean_subtitle_text(line)
+    weight = float(len(clean.replace(" ", "")))
     for ch in line:
-        if ch.strip():
-            weight += 1.0
         weight += _PUNCTUATION_WEIGHTS.get(ch, 0.0)
-    return weight
+    return max(1.0, weight)
+
+
+def _clean_subtitle_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    text = _SUBTITLE_ALLOWED_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def split_script_segments(script: str) -> list[str]:
+    raw = (script or "").replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [part.strip() for part in raw.split("\n") if part.strip()]
+    segments: list[str] = []
+    for paragraph in paragraphs:
+        pieces = [piece.strip() for piece in _SUBTITLE_BREAK_RE.split(paragraph) if piece.strip()]
+        for piece in pieces:
+            cleaned = _clean_subtitle_text(piece)
+            if cleaned:
+                segments.append(cleaned)
+    return segments
 
 
 def _auto_wrap(text: str, max_chars: int = 16) -> str:
-    text = re.sub(r"\s+", " ", (text or "").strip())
+    text = _clean_subtitle_text(text)
     if len(text) <= max_chars:
         return text
     parts: list[str] = []
@@ -74,15 +106,33 @@ def _auto_wrap(text: str, max_chars: int = 16) -> str:
 
 
 def probe_duration(media_path: str) -> float:
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", media_path]
+    cmd = [_FFPROBE_EXE, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", media_path]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if res.returncode == 0 and res.stdout.strip():
         return max(0.1, float(res.stdout.strip()))
     return 30.0
 
 
+def probe_audio_duration(media_path: str) -> float:
+    cmd = [_FFPROBE_EXE, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1", media_path]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if res.returncode == 0 and res.stdout.strip() and res.stdout.strip() != "N/A":
+        return max(0.1, float(res.stdout.strip().splitlines()[0]))
+    return probe_duration(media_path)
+
+
+def resolve_target_duration(input_video_path: str) -> float:
+    audio_duration = probe_audio_duration(input_video_path)
+    video_duration = probe_duration(input_video_path)
+    if audio_duration and audio_duration > 0:
+        if video_duration and video_duration > 0:
+            return round(min(audio_duration, video_duration), 3)
+        return round(audio_duration, 3)
+    return round(video_duration, 3)
+
+
 def probe_resolution(video_path: str) -> tuple[int, int]:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path]
+    cmd = [_FFPROBE_EXE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if res.returncode == 0 and "x" in res.stdout:
         w, h = res.stdout.strip().split("x", 1)
@@ -91,28 +141,64 @@ def probe_resolution(video_path: str) -> tuple[int, int]:
 
 
 def has_audio_stream(video_path: str) -> bool:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", video_path]
+    cmd = [_FFPROBE_EXE, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", video_path]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     return res.returncode == 0 and bool(res.stdout.strip())
 
 
 def create_timeline_by_chars(script: str, duration: float) -> list[dict[str, float | str]]:
-    lines = [line.strip() for line in script.splitlines() if line.strip()]
+    lines = split_script_segments(script)
     if not lines:
         return []
-    weights = [_line_weight(line) for line in lines]
+
+    duration = round(max(0.0, float(duration)), 3)
+    if duration <= 0:
+        return []
+
+    weights: list[float] = []
+    for line in lines:
+        char_count = len(line.replace(" ", ""))
+        weight = max(1.0, float(char_count))
+        if char_count <= 6:
+            weight += 1.4
+        elif char_count >= 18:
+            weight += 2.0
+        weights.append(weight)
+
     total_weight = sum(weights) or float(len(lines))
+    min_piece = 0.6
+    max_piece = 6.5
+    enforce_minimum = duration >= round(min_piece * len(lines), 3)
+    allocated: list[float] = []
+    remaining = duration
+
+    for idx, weight in enumerate(weights):
+        remaining_count = len(weights) - idx - 1
+        if idx == len(weights) - 1:
+            piece_duration = round(remaining, 3)
+        else:
+            piece_duration = round(duration * (weight / total_weight), 3)
+            if enforce_minimum:
+                piece_duration = max(min_piece, min(piece_duration, max_piece))
+                max_allowed = round(remaining - (remaining_count * min_piece), 3)
+                piece_duration = min(piece_duration, max_allowed)
+            else:
+                max_allowed = remaining
+                piece_duration = min(piece_duration, max_allowed)
+            piece_duration = round(max(0.001, piece_duration), 3)
+        allocated.append(piece_duration)
+        remaining = round(remaining - piece_duration, 3)
+
+    if allocated:
+        allocated[-1] = round(allocated[-1] + remaining, 3)
+
     timeline: list[dict[str, float | str]] = []
     cursor = 0.0
     for idx, line in enumerate(lines):
-        raw_duration = duration * (weights[idx] / total_weight)
-        line_duration = max(0.5, min(raw_duration, 30.0))
-        if idx == len(lines) - 1:
-            line_duration = max(0.5, duration - cursor)
         start = round(cursor, 3)
-        end = round(cursor + line_duration, 3)
-        timeline.append({"start": start, "duration": round(line_duration, 3), "end": end, "text": line})
-        cursor += line_duration
+        end = round(cursor + allocated[idx], 3)
+        timeline.append({"start": start, "duration": round(allocated[idx], 3), "end": end, "text": line})
+        cursor = end
     if timeline:
         timeline[-1]["end"] = round(duration, 3)
         timeline[-1]["duration"] = round(duration - float(timeline[-1]["start"]), 3)
@@ -166,19 +252,10 @@ def _pick_bgm(bgm_dir: Optional[str]) -> Optional[str]:
     return os.path.join(bgm_dir, random.choice(files)) if files else None
 
 
-def burn_subtitle_ffmpeg(input_video_path: str, ass_path: str, output_path: str, duration: float, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth") -> PostProcessResult:
+def burn_subtitle_ffmpeg(input_video_path: str, ass_path: str, output_path: str, duration: float, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth", bgm_volume: float = 0.32) -> PostProcessResult:
     width, height = probe_resolution(input_video_path)
-    preset = (preset or "smooth").lower()
-    preset_settings = {
-        "smooth": {"video_filter": [], "audio_volume": 1.12, "bgm_volume": 0.0, "font_size": 40, "outline": 2, "speed": "medium"},
-        "dynamic": {"video_filter": ["eq=contrast=1.08:saturation=1.12:brightness=0.02"], "audio_volume": 1.18, "bgm_volume": 0.32, "font_size": 42, "outline": 2, "speed": "fast"},
-        "cinematic": {"video_filter": ["eq=contrast=1.12:saturation=1.06:brightness=-0.01"], "audio_volume": 1.10, "bgm_volume": 0.28, "font_size": 44, "outline": 3, "speed": "slow"},
-        "subtle": {"video_filter": ["eq=contrast=1.04:saturation=1.02:brightness=0.0"], "audio_volume": 1.05, "bgm_volume": 0.0, "font_size": 38, "outline": 2, "speed": "medium"},
-        "caption": {"video_filter": [], "audio_volume": 1.12, "bgm_volume": 0.0, "font_size": 46, "outline": 3, "speed": "medium"},
-        "broll": {"video_filter": ["eq=contrast=1.05:saturation=1.08:brightness=0.0"], "audio_volume": 1.15, "bgm_volume": 0.26, "font_size": 40, "outline": 2, "speed": "fast"},
-    }.get(preset, {})
     ass_filter = f"subtitles='{_escape_filter_path(ass_path)}'"
-    filters = list(preset_settings.get("video_filter", [])) + [ass_filter]
+    filters = [ass_filter]
     if business_card_text:
         lines = [line.strip() for line in business_card_text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
         line_h = 21
@@ -192,24 +269,67 @@ def burn_subtitle_ffmpeg(input_video_path: str, ass_path: str, output_path: str,
             )
     vf = ",".join(filters)
     bgm_path = _pick_bgm(bgm_dir)
-    audio_volume = float(preset_settings.get("audio_volume", 1.12))
-    bgm_volume = float(preset_settings.get("bgm_volume", 0.0))
-    font_size = int(preset_settings.get("font_size", 40))
-    # 预留：后续可把 ASS 样式改成按 preset 动态生成
-    _ = font_size
-    if bgm_path and bgm_volume > 0:
+    debug_dir = os.path.dirname(output_path)
+    Path(os.path.join(debug_dir, "ffmpeg_bgm_choice.txt")).write_text(bgm_path or "NO_BGM_SELECTED", encoding="utf-8")
+    has_audio = has_audio_stream(input_video_path)
+    audio_volume = 1.0
+    bgm_volume = max(0.0, min(float(bgm_volume if bgm_volume is not None else 0.32), 1.0))
+    if bgm_path and bgm_volume > 0 and has_audio:
         fc = (
-            f"[0:a]volume={audio_volume:.2f},atrim=0:{duration:.3f},apad=whole_dur={duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[voice];"
-            f"[1:a]atrim=0:{duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume={bgm_volume:.2f},"
-            f"afade=t=in:st=0:d=1,afade=t=out:st={max(0, duration - 2):.3f}:d=2[music];"
+            f"[0:a]volume={audio_volume:.2f},atrim=0:{duration:.3f},apad=whole_dur={duration:.3f},aresample=48000,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo[voice];"
+            f"[1:a]atrim=0:{duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={bgm_volume:.2f},afade=t=in:st=0:d=1,afade=t=out:st={max(0, duration - 2):.3f}:d=2[music];"
             "[voice][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
-        cmd = ["ffmpeg", "-y", "-i", input_video_path, "-i", bgm_path, "-filter_complex", fc, "-map", "0:v", "-map", "[aout]", "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-threads", "4", "-t", f"{duration:.3f}", output_path]
-    elif has_audio_stream(input_video_path):
+        cmd = [_FFMPEG_EXE, "-y", "-stream_loop", "-1", "-i", input_video_path, "-stream_loop", "-1", "-i", bgm_path, "-filter_complex", fc, "-map", "0:v", "-map", "[aout]", "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-threads", "4", "-t", f"{duration:.3f}", output_path]
+    elif bgm_path and bgm_volume > 0:
+        fc = (
+            f"[1:a]atrim=0:{duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[voice];"
+            f"[2:a]atrim=0:{duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={bgm_volume:.2f},afade=t=in:st=0:d=1,afade=t=out:st={max(0, duration - 2):.3f}:d=2[music];"
+            "[voice][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        )
+        cmd = [
+            _FFMPEG_EXE,
+            "-y",
+            "-i",
+            input_video_path,
+            "-f",
+            "lavfi",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-stream_loop",
+            "-1",
+            "-i",
+            bgm_path,
+            "-filter_complex",
+            fc,
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            "-threads",
+            "4",
+            "-t",
+            f"{duration:.3f}",
+            output_path,
+        ]
+    elif has_audio:
         fc = f"[0:a]volume={audio_volume:.2f},atrim=0:{duration:.3f},apad=whole_dur={duration:.3f},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]"
-        cmd = ["ffmpeg", "-y", "-i", input_video_path, "-filter_complex", fc, "-map", "0:v", "-map", "[aout]", "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-threads", "4", "-t", f"{duration:.3f}", output_path]
+        cmd = [_FFMPEG_EXE, "-y", "-i", input_video_path, "-filter_complex", fc, "-map", "0:v", "-map", "[aout]", "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-threads", "4", "-t", f"{duration:.3f}", output_path]
     else:
-        cmd = ["ffmpeg", "-y", "-i", input_video_path, "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-threads", "4", "-t", f"{duration:.3f}", output_path]
+        cmd = [_FFMPEG_EXE, "-y", "-i", input_video_path, "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-threads", "4", "-t", f"{duration:.3f}", output_path]
     Path(os.path.join(os.path.dirname(output_path), "ffmpeg_burn_cmd.txt")).write_text(" ".join(cmd), encoding="utf-8")
     res = _run_ffmpeg(cmd)
     if res.returncode == 0 and os.path.exists(output_path):
@@ -219,19 +339,19 @@ def burn_subtitle_ffmpeg(input_video_path: str, ass_path: str, output_path: str,
     return PostProcessResult(False, "failed", error=err)
 
 
-def run_ffmpeg_post_process(task_id: str, input_video_path: str, output_dir: str, script: str, keep_original: bool = True, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth", attempt: int = 0, max_retry: int = 2) -> PostProcessResult:
+def run_ffmpeg_post_process(task_id: str, input_video_path: str, output_dir: str, script: str, keep_original: bool = True, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth", bgm_volume: float = 0.32, attempt: int = 0, max_retry: int = 2) -> PostProcessResult:
     os.makedirs(output_dir, exist_ok=True)
     if keep_original:
         try:
             shutil.copy2(input_video_path, os.path.join(output_dir, f"{task_id}_original.mp4"))
         except Exception:
             pass
-    duration = probe_duration(input_video_path)
+    duration = resolve_target_duration(input_video_path)
     width, height = probe_resolution(input_video_path)
     ass_path = os.path.join(output_dir, f"{task_id}.ass")
     build_ass_subtitles(script, ass_path, duration, width, height)
     output_path = os.path.join(output_dir, f"{task_id}_final.mp4")
-    result = burn_subtitle_ffmpeg(input_video_path, ass_path, output_path, duration, business_card_text, bgm_dir, preset)
+    result = burn_subtitle_ffmpeg(input_video_path, ass_path, output_path, duration, business_card_text, bgm_dir, preset, bgm_volume)
     if result.ok:
         try:
             os.remove(ass_path)
@@ -239,14 +359,14 @@ def run_ffmpeg_post_process(task_id: str, input_video_path: str, output_dir: str
             pass
         return result
     if attempt < max_retry:
-        return run_ffmpeg_post_process(task_id, input_video_path, output_dir, script, keep_original, business_card_text, bgm_dir, preset, attempt + 1, max_retry)
+        return run_ffmpeg_post_process(task_id, input_video_path, output_dir, script, keep_original, business_card_text, bgm_dir, preset, bgm_volume, attempt + 1, max_retry)
     return result
 
 
-def run_ffmpeg_post_process_from_base64(task_id: str, video_base64: str, output_dir: str, script: str, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth") -> PostProcessResult:
+def run_ffmpeg_post_process_from_base64(task_id: str, video_base64: str, output_dir: str, script: str, business_card_text: str = "", bgm_dir: Optional[str] = None, preset: str = "smooth", bgm_volume: float = 0.32) -> PostProcessResult:
     import base64
     input_path = os.path.join(output_dir, f"{task_id}_input.mp4")
     os.makedirs(output_dir, exist_ok=True)
     with open(input_path, "wb") as f:
         f.write(base64.b64decode(video_base64))
-    return run_ffmpeg_post_process(task_id, input_path, output_dir, script, keep_original=True, business_card_text=business_card_text, bgm_dir=bgm_dir, preset=preset)
+    return run_ffmpeg_post_process(task_id, input_path, output_dir, script, keep_original=True, business_card_text=business_card_text, bgm_dir=bgm_dir, preset=preset, bgm_volume=bgm_volume)

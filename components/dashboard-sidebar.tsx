@@ -19,6 +19,7 @@ import {
   Clock,
   Layers,
   Share2,
+  TicketPercent,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { UserMenu } from "@/components/user-menu"
@@ -50,6 +51,7 @@ const mainNav: NavItem[] = [
     ],
   },
   { label: "一键分发", icon: Share2, badge: "NEW", iconColor: "text-sky-500", iconBg: "bg-sky-500/10" },
+  { label: "充值兑换", icon: TicketPercent, iconColor: "text-amber-500", iconBg: "bg-amber-500/10" },
   { label: "智能体中心", icon: Bot, iconColor: "text-indigo-500", iconBg: "bg-indigo-500/10" },
   { label: "规划路线", icon: MapPinned, iconColor: "text-orange-500", iconBg: "bg-orange-500/10" },
 ]

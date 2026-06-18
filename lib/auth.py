@@ -11,6 +11,8 @@ from typing import Optional
 
 from lib.db import connect, transaction
 
+ADMIN_SESSION_COOKIE = "admin_session_id"
+
 EMAIL_HASH_SALT = os.getenv("EMAIL_HASH_SALT", "")
 if not EMAIL_HASH_SALT:
     if os.getenv("DEV_EMAIL_MODE", "0") == "1" or "--reload" in sys.argv:
@@ -23,6 +25,8 @@ SESSION_TTL_DAYS = int(os.getenv("CREDIT_SESSION_TTL_DAYS", "30"))
 EMAIL_TOKEN_TTL_S = int(os.getenv("CREDIT_EMAIL_TOKEN_TTL_SECONDS", "900"))
 
 SESSION_COOKIE = "session_id"
+ADMIN_LOGIN_NAME = os.getenv("ADMIN_LOGIN_NAME", "18000634365")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH", "")
 
 
 def normalize_login_name(login_name: str) -> str:
@@ -291,6 +295,24 @@ def verify_password_login(login_name: str, password: str, ip: str = "") -> Optio
         conn.commit()
         record_login_attempt(login_name_norm, ip, True)
         return int(row["id"])
+    finally:
+        conn.close()
+
+
+def get_user_identity(user_id: int) -> Optional[dict]:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT id, email_masked, login_name FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "email_masked": row["email_masked"],
+            "login_name": row["login_name"],
+        }
     finally:
         conn.close()
 

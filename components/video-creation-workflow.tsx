@@ -11,9 +11,6 @@ import {
   Loader2,
   AlertCircle,
   Sparkles,
-  Zap,
-  Wand2,
-  Scissors,
   RefreshCw,
   Download,
   Square,
@@ -44,6 +41,7 @@ import {
   type VideoTaskState,
 } from "@/lib/video-task-store"
 import {
+  createGenerateSubmissionPatch,
   deriveWorkflowUi,
   getTaskHealth,
   getTaskHealthMessage,
@@ -52,6 +50,7 @@ import {
   type WorkflowStepStatus as StepStatus,
 } from "@/lib/video-task-runtime"
 import { getFastapiBase } from "@/lib/fastapi-base"
+import { getCoverUiState } from "@/lib/video-cover-ui"
 
 type UploadedImage = {
   file: File
@@ -78,6 +77,11 @@ type Props = {
   initialScript?: string
 }
 
+type CardInfo = {
+  text: string
+  placeholder: string
+}
+
 type EditTaskResponse = {
   edit_job_id: string
   task_id?: string
@@ -87,6 +91,13 @@ type EditTaskResponse = {
   source?: string
   output_video_url?: string
   error?: string
+}
+
+type ManualUploadResponse = {
+  upload_id: string
+  file_url?: string
+  original_name?: string
+  size?: number
 }
 
 type ManualEditResponse = {
@@ -105,14 +116,7 @@ const ACCEPTED_IMAGES = ".jpg,.jpeg,.png,.webp,.bmp,.gif"
 const ACCEPTED_AUDIO = ".mp3,.wav,.m4a,.ogg"
 const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
 
-const EDITING_PRESETS: EditingPreset[] = [
-  { id: "smooth", name: "流畅剪辑", icon: Scissors, description: "自动去除停顿与冗余，保持自然节奏" },
-  { id: "dynamic", name: "动感快剪", icon: Zap, description: "快节奏卡点，适合产品展示与宣传" },
-  { id: "cinematic", name: "电影质感", icon: Clapperboard, description: "电影级调色与转场，适合品牌大片" },
-  { id: "subtle", name: "轻量美化", icon: Sparkles, description: "微调亮度对比度，保持原片质感" },
-  { id: "caption", name: "字幕增强", icon: FileText, description: "自动生成动态字幕，重点高亮" },
-  { id: "broll", name: "B-Roll 混剪", icon: Wand2, description: "自动插入素材库镜头，丰富画面层次" },
-]
+const DEFAULT_EDITING_PRESET = "default"
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -131,6 +135,10 @@ function fileToBase64(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("读取失败"))
     reader.readAsDataURL(file)
   })
+}
+
+function normalizeCoverStatus(value: unknown): VideoTaskState["coverStatus"] {
+  return value === "running" || value === "success" || value === "failed" ? value : "idle"
 }
 
 /* ------------------------------------------------------------------ */
@@ -272,6 +280,10 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const [manualVideoFile, setManualVideoFile] = React.useState<File | null>(null)
   const [manualVideoPreview, setManualVideoPreview] = React.useState("")
   const [manualUploadBusy, setManualUploadBusy] = React.useState(false)
+  const [coverRetryBusy, setCoverRetryBusy] = React.useState(false)
+  const [manualUploadId, setManualUploadId] = React.useState("")
+  const [businessCardText, setBusinessCardText] = React.useState(taskState.businessCardText || "")
+  const [bgmVolume, setBgmVolume] = React.useState(taskState.bgmVolume ?? 0.32)
   const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollSessionRef = React.useRef(0)
   const pollInFlightRef = React.useRef(false)
@@ -317,19 +329,25 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const taskId = taskState.taskId
   const script = taskState.script
   const gender = taskState.gender
+  const status = taskState.status
   const videoUrl = taskState.videoUrl
   const coverUrl = taskState.coverUrl
+  const coverStatus = taskState.coverStatus
+  const coverError = taskState.coverError
+  const coverTaskId = taskState.coverTaskId
   const isProcessing = taskState.isProcessing
   const errorMessage = taskState.errorMessage
   const editingErrorMessage = taskState.editingErrorMessage
-  const selectedPreset = taskState.selectedPreset
+  const selectedPreset = DEFAULT_EDITING_PRESET
   const isEditing = taskState.isEditing
   const stageProgress = taskState.stageProgress
   const currentStage = taskState.currentStage
   const setScript = (v: string) => updateTask({ script: v })
   const setGender = (v: "male" | "female") => updateTask({ gender: v })
   const setVideoUrl = (v: string) => updateTask({ videoUrl: v })
-  const setSelectedPreset = (v: string | null) => updateTask({ selectedPreset: v || "", editingErrorMessage: "" })
+  const setSelectedPreset = (_v: string | null) => updateTask({ selectedPreset: DEFAULT_EDITING_PRESET, editingErrorMessage: "" })
+  const setBusinessCardTextState = (v: string) => { setBusinessCardText(v); updateTask({ businessCardText: v }) }
+  const setBgmVolumeState = (v: number) => { setBgmVolume(v); updateTask({ bgmVolume: v }) }
   const setIsEditing = (v: boolean) => updateTask({ isEditing: v })
 
   const scriptRef = React.useRef(taskState.script)
@@ -337,6 +355,12 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const genderRef = React.useRef(gender)
   genderRef.current = gender
   const workflowUi = React.useMemo(() => deriveWorkflowUi(taskState), [taskState])
+  const coverUi = React.useMemo(() => getCoverUiState({
+    coverUrl,
+    coverStatus,
+    coverError,
+    videoStatus: status,
+  }), [coverError, coverStatus, coverUrl, status])
 
   React.useEffect(() => {
     return () => {
@@ -357,49 +381,18 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     })
     try {
       setManualUploadBusy(true)
-      const base64 = await fileToBase64(file)
       const base = getFastapiBase()
       if (!base) throw new Error("请配置 NEXT_PUBLIC_FASTAPI_URL")
-      const resp = await fetch(`${base}/api/video/edit`, {
+      const formData = new FormData()
+      formData.append("file", file)
+      const uploadResp = await fetch(`${base}/api/video/manual-upload`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          video_base64: base64,
-          preset: selectedPreset || "smooth",
-          subtitle_text: scriptRef.current.trim(),
-          source: "manual",
-        }),
+        body: formData,
       })
-      const data = (await resp.json()) as EditTaskResponse & { detail?: string }
-      if (!resp.ok) throw new Error(data.detail || "手动剪辑失败")
-      const editJobId = data.edit_job_id
-      while (true) {
-        const statusResp = await fetch(`${base}/api/video/edit/status?editJobId=${encodeURIComponent(editJobId)}`)
-        const statusData = (await statusResp.json()) as EditTaskResponse & { detail?: string }
-        if (!statusResp.ok) throw new Error(statusData.detail || "查询剪辑状态失败")
-        if (statusData.status === "success" && statusData.output_video_url) {
-          const finalUrl = statusData.output_video_url.startsWith("http")
-            ? statusData.output_video_url
-            : `${base.replace(/\/$/, "")}${statusData.output_video_url}`
-          setVideoUrl(finalUrl)
-          updateTask({
-            status: "published",
-            currentStage: "done",
-            isProcessing: false,
-            videoUrl: finalUrl,
-            postProcessingStage: "published",
-            postProcessingProgress: 100,
-            postProcessingErrorMessage: "",
-            progress: 100,
-          })
-          toast({ title: "手动剪辑完成", description: "已对上传视频执行后处理" })
-          break
-        }
-        if (statusData.status === "failed") {
-          throw new Error(statusData.error || "手动剪辑失败")
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 1500))
-      }
+      const uploadData = (await uploadResp.json()) as ManualUploadResponse & { detail?: string }
+      if (!uploadResp.ok || !uploadData.upload_id) throw new Error(uploadData.detail || "手动上传失败")
+      setManualUploadId(uploadData.upload_id)
+      toast({ title: "视频上传成功", description: "已保存到后端，可继续应用剪辑效果" })
     } catch (error) {
       toast({ title: "手动上传后处理失败", description: error instanceof Error ? error.message : "请检查后端服务与视频格式", variant: "destructive" })
     } finally {
@@ -407,6 +400,13 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
   }, [setVideoUrl, toast, updateTask])
 
+  const imagePreviewSrc = image?.previewUrl || taskState.imagePreview
+  const editableVideoUrl = videoUrl || manualVideoPreview
+  React.useEffect(() => { updateTask({ businessCardText, bgmVolume }) }, [businessCardText, bgmVolume, updateTask])
+  const cardInfo: CardInfo = React.useMemo(() => ({
+    text: businessCardText,
+    placeholder: "例如：张三｜短视频运营｜专注本地生活获客",
+  }), [businessCardText])
   const manualVideoUrl = React.useMemo(() => manualVideoPreview, [manualVideoPreview])
   const manualUploadLabel = manualVideoFile ? `${manualVideoFile.name} · ${formatSize(manualVideoFile.size)}` : "未选择视频文件"
   const activeStep = workflowUi.activeStep
@@ -418,7 +418,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const lastStatusAtLabel = taskState.lastStatusAt
     ? new Date(taskState.lastStatusAt).toLocaleString("zh-CN", { hour12: false })
     : "暂未同步到任务状态"
-  const imagePreviewSrc = image?.previewUrl || taskState.imagePreview
   const imageBase64 = image?.base64 || taskState.imageBase64
   const audioBase64 = audio?.base64 || taskState.audioBase64
   const audioName = audio?.name || taskState.audioName
@@ -545,6 +544,12 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   }, [failTask])
 
   const handleReturnFromLocalPreview = React.useCallback(() => {
+    setManualUploadId("")
+    setManualVideoFile(null)
+    setManualVideoPreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return ""
+    })
     updateTask({
       status: "pending",
       currentStage: "idle",
@@ -556,6 +561,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       progress: 0,
       videoUrl: "",
       coverUrl: "",
+      coverStatus: "idle",
+      coverError: "",
+      coverTaskId: "",
       selectedPreset: "",
       resumeGraceUntil: 0,
       pollErrorCount: 0,
@@ -610,6 +618,19 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           const now = Date.now()
           updateTask({ lastStatusAt: now, resumeGraceUntil: 0, pollErrorCount: 0, lastPollError: "" })
           const s = sd.status?.toLowerCase()
+          const nextCoverStatus = normalizeCoverStatus((sd.cover_status || sd.coverStatus || "").toLowerCase())
+          const nextCoverError =
+            typeof sd.cover_error === "string"
+              ? sd.cover_error
+              : typeof sd.coverError === "string"
+                ? sd.coverError
+                : ""
+          const nextCoverTaskId =
+            typeof sd.cover_task_id === "string"
+              ? sd.cover_task_id
+              : typeof sd.coverTaskId === "string"
+                ? sd.coverTaskId
+                : ""
           if (s === "success" || s === "post_processing" || s === "published") {
             const vUrl = sd.video_url || sd.videoUrl || ""
             const cUrl = sd.cover_url || sd.coverUrl || ""
@@ -627,6 +648,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 editingErrorMessage: "",
                 videoUrl: vUrl,
                 coverUrl: cUrl,
+                coverStatus: cUrl ? "success" : nextCoverStatus,
+                coverError: cUrl ? "" : nextCoverError,
+                coverTaskId: nextCoverTaskId,
                 postProcessingStage: "running",
                 postProcessingProgress: postProgress || 30,
                 postProcessingErrorMessage: "",
@@ -648,6 +672,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 editingErrorMessage: "",
                 videoUrl: postUrl || vUrl,
                 coverUrl: cUrl,
+                coverStatus: cUrl ? "success" : nextCoverStatus,
+                coverError: cUrl ? "" : nextCoverError,
+                coverTaskId: nextCoverTaskId,
                 postProcessingStage: "published",
                 postProcessingProgress: 100,
                 postProcessingErrorMessage: "",
@@ -668,6 +695,28 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               return
             }
 
+            if (nextCoverStatus === "failed") {
+              coverWaitStartRef.current = 0
+              shouldScheduleNext = false
+              stopBackgroundPoll()
+              updateTask({
+                status: "success",
+                currentStage: "done",
+                isProcessing: false,
+                errorMessage: "",
+                editingErrorMessage: "",
+                videoUrl: postUrl || vUrl,
+                coverUrl: "",
+                coverStatus: "failed",
+                coverError: nextCoverError || "封面生成失败，可重试",
+                coverTaskId: nextCoverTaskId,
+                progress: 100,
+                stageProgress: nextStageProgress,
+                lastStatusAt: now,
+              })
+              return
+            }
+
             if (vUrl && !cUrl) {
               if (coverWaitStartRef.current === 0) {
                 coverWaitStartRef.current = Date.now()
@@ -685,6 +734,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   editingErrorMessage: "",
                   videoUrl: vUrl,
                   coverUrl: "",
+                  coverStatus: "failed",
+                  coverError: nextCoverError || "封面生成超时，请稍后重试。",
+                  coverTaskId: nextCoverTaskId,
                   progress: 100,
                   stageProgress: nextStageProgress,
                   lastStatusAt: now,
@@ -698,6 +750,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   editingErrorMessage: "",
                   videoUrl: vUrl,
                   coverUrl: "",
+                  coverStatus: "running",
+                  coverError: "",
+                  coverTaskId: nextCoverTaskId,
                   progress: 100,
                   stageProgress: nextStageProgress,
                   lastStatusAt: now,
@@ -715,6 +770,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 editingErrorMessage: "",
                 videoUrl: postUrl || vUrl,
                 coverUrl: cUrl,
+                coverStatus: cUrl ? "success" : nextCoverStatus,
+                coverError: cUrl ? "" : nextCoverError,
+                coverTaskId: nextCoverTaskId,
                 postProcessingStage: postStage === "failed" ? "failed" : "",
                 postProcessingProgress: postStage === "failed" ? 0 : 100,
                 postProcessingErrorMessage: sd.post_error || sd.postError || "",
@@ -735,6 +793,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               postProcessingErrorMessage: postErr,
               videoUrl: sd.video_url || sd.videoUrl || "",
               coverUrl: sd.cover_url || sd.coverUrl || "",
+              coverStatus: sd.cover_url || sd.coverUrl ? "success" : nextCoverStatus,
+              coverError: sd.cover_url || sd.coverUrl ? "" : nextCoverError,
+              coverTaskId: nextCoverTaskId,
               errorMessage: "",
             })
           } else if (s === "failed") {
@@ -792,22 +853,11 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     }
     const submittedAt = Date.now()
     updateTask({
-      status: "scanning",
-      currentStage: "voice",
-      lastHeartbeat: submittedAt,
-      submittedAt,
-      lastStatusAt: 0,
-      resumeGraceUntil: 0,
-      pollErrorCount: 0,
-      lastPollError: "",
-      taskId: "",
-      isProcessing: true,
-      errorMessage: "",
-      editingErrorMessage: "",
-      videoUrl: "",
+      ...createGenerateSubmissionPatch(submittedAt),
       coverUrl: "",
-      progress: 0,
-      stageProgress: { voiceClone: 0, videoGen: 0, editing: 0 },
+      coverStatus: "idle",
+      coverError: "",
+      coverTaskId: "",
     })
 
     try {
@@ -925,7 +975,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   }, [currentStage])
 
   const handleApplyEditing = React.useCallback(async () => {
-    if (!selectedPreset || isEditing) return
+    if (isEditing) return
 
     const resetEditingProgress = { ...taskStateRef.current.stageProgress, editing: 0 }
     setIsEditing(true)
@@ -962,10 +1012,13 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           task_id: taskIdRef.current,
-          video_url: videoUrl,
+          video_url: manualUploadId ? "" : (videoUrl || manualVideoPreview),
+          upload_id: manualUploadId,
           preset: selectedPreset,
           subtitle_text: script.trim(),
-          source: isLocalPreviewMode ? "manual" : "generated",
+          business_card_text: businessCardText.trim(),
+          bgm_volume: bgmVolume,
+          source: manualUploadId ? "manual" : manualVideoPreview ? "manual" : isLocalPreviewMode ? "manual" : "generated",
         }),
       })
       const data = (await res.json()) as EditTaskResponse & { detail?: string }
@@ -1016,7 +1069,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     } finally {
       setIsEditing(false)
     }
-  }, [isEditing, isLocalPreviewMode, script, selectedPreset, setIsEditing, setVideoUrl, updateTask, videoUrl])
+  }, [bgmVolume, businessCardText, isEditing, isLocalPreviewMode, manualUploadId, manualVideoPreview, script, selectedPreset, setIsEditing, setVideoUrl, updateTask, videoUrl])
 
   const handleRetry = React.useCallback(() => {
     stopBackgroundPoll()
@@ -1032,6 +1085,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       editingErrorMessage: "",
       videoUrl: "",
       coverUrl: "",
+      coverStatus: "idle",
+      coverError: "",
+      coverTaskId: "",
       submittedAt: 0,
       lastStatusAt: 0,
       resumeGraceUntil: 0,
@@ -1039,6 +1095,51 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       lastPollError: "",
     })
   }, [stopBackgroundPoll, updateTask])
+
+  const handleRetryCover = React.useCallback(async () => {
+    if (!taskId || coverRetryBusy) return
+
+    const base = getFastapiBase()
+    if (!base) {
+      toast({ title: "缺少后端配置", description: "请配置 NEXT_PUBLIC_FASTAPI_URL", variant: "destructive" })
+      return
+    }
+
+    setCoverRetryBusy(true)
+    updateTask({
+      coverUrl: "",
+      coverStatus: "running",
+      coverError: "",
+      coverTaskId: "",
+    })
+
+    try {
+      const res = await fetch(`${base}/api/video/cover`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: taskId }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "封面重试失败")
+
+      updateTask({
+        coverUrl: typeof data.cover_url === "string" ? data.cover_url : "",
+        coverStatus: "success",
+        coverError: "",
+        coverTaskId: typeof data.cover_task_id === "string" ? data.cover_task_id : "",
+      })
+      toast({ title: "封面生成成功", description: "已更新视频封面，可直接下载使用。" })
+    } catch (error) {
+      updateTask({
+        coverStatus: "failed",
+        coverError: error instanceof Error ? error.message : "封面重试失败",
+        coverTaskId: "",
+      })
+      toast({ title: "封面生成失败", description: error instanceof Error ? error.message : "请稍后重试", variant: "destructive" })
+    } finally {
+      setCoverRetryBusy(false)
+    }
+  }, [coverRetryBusy, taskId, updateTask])
 
   const steps = [
     { id: 1 as StepId, label: "素材准备", status: stepStatuses[1] },
@@ -1202,6 +1303,23 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                     已从文案创作导入
                   </p>
                 )}
+
+                <div className="rounded-2xl border border-slate-200/60 bg-slate-50/70 p-4 dark:border-white/10 dark:bg-slate-950/30">
+                  <div className="mb-3 flex items-center gap-2">
+                    <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-rose-50 text-rose-500 dark:bg-rose-500/10"><FileText className="h-4 w-4" /></span>
+                    <div>
+                      <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">个人名片</p>
+                      <p className="text-[12px] text-slate-500 dark:text-slate-400">非必填，仅为后续名片烧录提供文案</p>
+                    </div>
+                  </div>
+                  <textarea
+                    value={businessCardText}
+                    onChange={(e) => setBusinessCardTextState(e.target.value)}
+                    placeholder={cardInfo.placeholder}
+                    rows={4}
+                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-[13px] text-slate-700 outline-none transition focus:border-rose-400 dark:border-white/10 dark:bg-slate-950/50 dark:text-slate-200"
+                  />
+                </div>
               </div>
             </div>
 
@@ -1303,6 +1421,9 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       progress: 100,
                       videoUrl: "",
                       coverUrl: "",
+                      coverStatus: "idle",
+                      coverError: "",
+                      coverTaskId: "",
                       resumeGraceUntil: 0,
                       pollErrorCount: 0,
                       lastPollError: "",
@@ -1563,6 +1684,14 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 <div className="h-28 w-20 shrink-0 overflow-hidden rounded-lg bg-slate-100 dark:bg-white/5">
                   {coverUrl ? (
                     <img src={coverUrl} alt="封面图" className="h-full w-full object-cover" />
+                  ) : coverUi.kind === "failed" ? (
+                    <div className="flex h-full w-full items-center justify-center bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                      <AlertCircle className="h-5 w-5" />
+                    </div>
+                  ) : coverUi.kind === "idle" ? (
+                    <div className="flex h-full w-full items-center justify-center bg-slate-50 text-slate-300 dark:bg-white/5 dark:text-slate-600">
+                      <ImageIcon className="h-5 w-5" />
+                    </div>
                   ) : (
                     <div className="flex h-full w-full items-center justify-center">
                       <Loader2 className="h-5 w-5 animate-spin text-slate-300" />
@@ -1572,8 +1701,13 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 <div className="min-w-0 flex-1">
                   <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">视频封面</p>
                   <p className="mt-0.5 text-[12px] text-slate-500 dark:text-slate-400">
-                    {coverUrl ? "竖屏 3:4 封面图，可下载使用" : "封面图自动生成中…"}
+                    {coverUi.message}
                   </p>
+                  {coverTaskId && coverUi.kind === "running" && (
+                    <p className="mt-1 text-[11px] text-slate-400">
+                      封面任务 ID：{coverTaskId}
+                    </p>
+                  )}
                   {coverUrl && (
                     <a
                       href={coverUrl}
@@ -1586,116 +1720,112 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                       下载封面
                     </a>
                   )}
+                  {coverUi.allowRetry && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => { void handleRetryCover() }}
+                      disabled={coverRetryBusy}
+                      className="mt-2"
+                    >
+                      {coverRetryBusy ? "重新生成中..." : "重新生成封面"}
+                    </Button>
+                  )}
                 </div>
               </div>
             )}
 
-            <div className="flex items-center gap-2">
-              <span className="text-[13px] font-medium text-slate-600 dark:text-slate-400">选择剪辑效果</span>
-            </div>
-
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {EDITING_PRESETS.map((preset) => (
-                <button
-                  key={preset.id}
-                  type="button"
-                  onClick={() => setSelectedPreset(preset.id)}
-                  className={cn(
-                    "flex items-start gap-3 rounded-2xl border p-4 text-left transition-all duration-200",
-                    selectedPreset === preset.id
-                      ? "border-rose-400/60 bg-rose-50/50 shadow-sm dark:border-rose-500/40 dark:bg-rose-500/10"
-                      : "border-slate-200/60 bg-white hover:border-slate-300 dark:border-white/10 dark:bg-white/5 dark:hover:border-white/20",
-                  )}
-                >
-                  <span
-                    className={cn(
-                      "flex h-10 w-10 shrink-0 items-center justify-center rounded-xl",
-                      selectedPreset === preset.id
-                        ? "bg-rose-100 text-rose-600 dark:bg-rose-500/20 dark:text-rose-400"
-                        : "bg-slate-50 text-slate-400 dark:bg-white/5",
-                    )}
-                  >
-                    <preset.icon className="h-5 w-5" />
-                  </span>
+            <div className="rounded-2xl border border-slate-200/60 bg-white p-4 dark:border-white/10 dark:bg-white/5">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-rose-50 text-rose-500 dark:bg-rose-500/10"><Sparkles className="h-4 w-4" /></span>
                   <div>
-                    <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">
-                      {preset.name}
-                    </p>
-                    <p className="mt-0.5 text-[12px] leading-relaxed text-slate-500 dark:text-slate-400">
-                      {preset.description}
-                    </p>
+                    <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">BGM 音量</p>
+                    <p className="text-[12px] text-slate-500 dark:text-slate-400">默认 32%，可按视频风格微调</p>
                   </div>
-                  {selectedPreset === preset.id && (
-                    <CheckCircle2 className="ml-auto h-4 w-4 shrink-0 text-rose-500" />
-                  )}
-                </button>
-              ))}
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={Math.round((bgmVolume ?? 0.32) * 100)}
+                  onChange={(e) => setBgmVolumeState(Number(e.target.value) / 100)}
+                  className="w-full"
+                />
+                <div className="mt-2 flex items-center justify-between text-[12px] text-slate-500 dark:text-slate-400">
+                  <span>0%</span>
+                  <span>{Math.round((bgmVolume ?? 0.32) * 100)}%</span>
+                  <span>100%</span>
+                </div>
             </div>
 
-            {/* Apply Button */}
-            {selectedPreset && (
-              <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-5 dark:border-white/5">
-                <Button
-                  onClick={() => { void handleApplyEditing() }}
-                  disabled={isEditing || !videoUrl}
-                  className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-rose-500 to-pink-500 px-8 py-3.5 text-[15px] font-bold text-white shadow-lg shadow-rose-500/25 transition-all hover:from-rose-600 hover:to-pink-600 active:scale-[0.97] disabled:opacity-60"
-                >
-                  {isEditing ? (
-                    <>
-                      <Loader2 className="h-5 w-5 animate-spin" />
-                      渲染中…
-                    </>
-                  ) : (
-                    <>
-                      <Wand2 className="h-5 w-5" />
-                      应用剪辑效果
-                    </>
-                  )}
-                </Button>
-                {!videoUrl && (
-                  <p className="text-center text-[12px] text-slate-500 dark:text-slate-400">
-                    请先准备好视频，再应用剪辑效果。
-                  </p>
-                )}
-                {!isLocalPreviewMode && editingErrorMessage && !isEditing && (
-                  <div className="w-full max-w-xl rounded-xl border border-amber-200/60 bg-amber-50/60 p-3 dark:border-amber-500/20 dark:bg-amber-500/5">
-                    <div className="flex items-start gap-2">
-                      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-[13px] font-medium text-amber-800 dark:text-amber-300">
-                          剪辑失败
-                        </p>
-                        <p className="text-[12px] text-amber-700 dark:text-amber-400">
-                          {editingErrorMessage}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => { void handleApplyEditing() }}
-                      className="mt-2 inline-flex items-center gap-1 rounded-lg bg-amber-100 px-3 py-1.5 text-[12px] font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20"
-                    >
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      重试剪辑
-                    </button>
-                  </div>
-                )}
-                {/* 剪辑进度条 — isEditing 时按钮变进度条 */}
-                {isEditing && currentStage === "editing" ? (
-                  <div className="flex w-full max-w-sm flex-col items-center gap-2">
-                    <div className="h-3 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
-                      <div
-                        className="h-full rounded-full bg-gradient-to-r from-violet-500 to-purple-500 transition-all duration-300"
-                        style={{ width: `${stageProgress.editing}%` }}
-                      />
-                    </div>
-                    <p className="text-center text-[12px] font-medium text-slate-500">
-                      剪辑中 {stageProgress.editing}%
-                    </p>
-                  </div>
-                ) : null}
+            <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-5 dark:border-white/5">
+              <div className="w-full max-w-xl rounded-2xl border border-slate-200/60 bg-white p-4 text-center dark:border-white/10 dark:bg-white/5">
+                <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">默认剪辑效果</p>
+                <p className="mt-1 text-[12px] leading-relaxed text-slate-500 dark:text-slate-400">
+                  自动烧录干净字幕、混入 BGM，并按音频时长裁剪，不调整画面滤镜。
+                </p>
               </div>
-            )}
+              <Button
+                onClick={() => { void handleApplyEditing() }}
+                disabled={isEditing || !editableVideoUrl || manualUploadBusy}
+                className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-rose-500 to-pink-500 px-8 py-3.5 text-[15px] font-bold text-white shadow-lg shadow-rose-500/25 transition-all hover:from-rose-600 hover:to-pink-600 active:scale-[0.97] disabled:opacity-60"
+              >
+                {isEditing ? (
+                  <>
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    渲染中…
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-5 w-5" />
+                    应用默认剪辑
+                  </>
+                )}
+              </Button>
+              {!videoUrl && (
+                <p className="text-center text-[12px] text-slate-500 dark:text-slate-400">
+                  请先准备好视频，再应用默认剪辑。
+                </p>
+              )}
+              {!isLocalPreviewMode && editingErrorMessage && !isEditing && (
+                <div className="w-full max-w-xl rounded-xl border border-amber-200/60 bg-amber-50/60 p-3 dark:border-amber-500/20 dark:bg-amber-500/5">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[13px] font-medium text-amber-800 dark:text-amber-300">
+                        剪辑失败
+                      </p>
+                      <p className="text-[12px] text-amber-700 dark:text-amber-400">
+                        {editingErrorMessage}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { void handleApplyEditing() }}
+                    className="mt-2 inline-flex items-center gap-1 rounded-lg bg-amber-100 px-3 py-1.5 text-[12px] font-medium text-amber-700 transition-colors hover:bg-amber-200 dark:bg-amber-500/10 dark:text-amber-400 dark:hover:bg-amber-500/20"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    重试剪辑
+                  </button>
+                </div>
+              )}
+              {isEditing && currentStage === "editing" ? (
+                <div className="flex w-full max-w-sm flex-col items-center gap-2">
+                  <div className="h-3 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-violet-500 to-purple-500 transition-all duration-300"
+                      style={{ width: `${stageProgress.editing}%` }}
+                    />
+                  </div>
+                  <p className="text-center text-[12px] font-medium text-slate-500">
+                    剪辑中 {stageProgress.editing}%
+                  </p>
+                </div>
+              ) : null}
+            </div>
           </section>
         )}
 

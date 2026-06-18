@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
-import { LogOut, LogIn, ChevronUp, Coins, Loader2 } from "lucide-react"
+import { LogOut, LogIn, ChevronUp, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -16,11 +16,11 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 
-type Me = { user: { id: number; email_masked: string; login_name?: string }; balance: number } | null
+type Me = { user: { id: number; email_masked: string; login_name?: string }; balance: number } | null | undefined
 
 export function UserMenu() {
   const router = useRouter()
-  const [me, setMe] = useState<Me | undefined>(undefined)
+  const [me, setMe] = useState<Me>(undefined)
   const [openLogin, setOpenLogin] = useState(false)
   const [openMenu, setOpenMenu] = useState(false)
   const [tab, setTab] = useState<"login" | "register">("login")
@@ -28,6 +28,8 @@ export function UserMenu() {
   const [password, setPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
   const [sending, setSending] = useState(false)
+  const [authMessage, setAuthMessage] = useState("")
+  const [authError, setAuthError] = useState("")
 
   const refresh = async () => {
     try {
@@ -86,6 +88,8 @@ export function UserMenu() {
       return
     }
     setSending(true)
+    setAuthError("")
+    setAuthMessage(tab === "register" ? "正在注册并登录…" : "正在登录…")
     try {
       const path = tab === "register" ? "/api/auth/register" : "/api/auth/login"
       const body = tab === "register"
@@ -107,8 +111,11 @@ export function UserMenu() {
       toast.success(tab === "register" ? "注册成功" : "登录成功")
       router.refresh()
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "请求失败")
+      const message = e instanceof Error ? e.message : "请求失败"
+      setAuthError(message)
+      toast.error(message)
     } finally {
+      setAuthMessage("")
       setSending(false)
     }
   }
@@ -192,6 +199,9 @@ export function UserMenu() {
                 <p className="text-xs text-muted-foreground">输入已注册账号与密码登录。</p>
               )}
             </div>
+            <div className="min-h-5 text-xs">
+              {authError ? <span className="text-destructive">{authError}</span> : <span className="text-muted-foreground">{authMessage}</span>}
+            </div>
             <DialogFooter>
               <Button onClick={submitAuth} disabled={sending}>
                 {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : tab === "register" ? "注册并登录" : "登录"}
@@ -218,10 +228,8 @@ export function UserMenu() {
         </div>
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-foreground">{me.user.login_name || me.user.email_masked}</p>
-          <p className="flex items-center gap-1 truncate text-[11px] text-muted-foreground">
-            <Coins className="h-3 w-3 text-amber-500" />
-            <span className="tabular-nums">{me.balance}</span>
-            <span>积分</span>
+          <p className="truncate text-[11px] text-muted-foreground">
+            {me.user.login_name || me.user.email_masked}
           </p>
         </div>
         <ChevronUp

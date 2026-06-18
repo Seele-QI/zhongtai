@@ -19,11 +19,22 @@ from lib.video_postprocess import run_ffmpeg_post_process, run_ffmpeg_post_proce
 
 from lib.auth import (
     SESSION_COOKIE, consume_email_token, create_password_user, create_session, destroy_session,
-    get_current_user, get_or_create_user_by_hash, hash_email, mask_email,
+    get_current_user, get_or_create_user_by_hash, get_user_identity, hash_email, mask_email,
     normalize_login_name, save_email_token, generate_token, validate_login_name,
     validate_password, verify_password_login,
 )
-from lib.credit import get_account, list_ledger
+from lib.credit import (
+    CHAT_COST,
+    REDEEM_CODE_AMOUNTS,
+    VIDEO_CREATION_COST,
+    consume,
+    ensure_credit_schema,
+    generate_redeem_codes,
+    get_account,
+    list_ledger,
+    list_redeem_code_batches,
+    redeem_code,
+)
 from lib.rate_limit import check_ip, check_email
 from lib.email import send_login_link
 
@@ -31,11 +42,42 @@ load_dotenv()
 
 # 说明：前端「爆改 / 智能体」已改为 Next 直连 DeepSeek；本服务可选（pnpm dev:all 或单独部署时保留）。
 app = FastAPI()
-POST_PROCESS_ROOT = os.path.join(tempfile.gettempdir(), "video-postprocess-public")
-MANUAL_UPLOAD_ROOT = os.path.join(tempfile.gettempdir(), "video-manual-uploads")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_PUBLIC_ROOT = os.path.join(PROJECT_ROOT, "public")
+POST_PROCESS_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-postprocess")
+GENERATED_VIDEO_CACHE_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-cache", "generated")
+MANUAL_UPLOAD_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-cache", "manual-uploads")
 os.makedirs(POST_PROCESS_ROOT, exist_ok=True)
+os.makedirs(GENERATED_VIDEO_CACHE_ROOT, exist_ok=True)
 os.makedirs(MANUAL_UPLOAD_ROOT, exist_ok=True)
 app.mount("/static/video-postprocess", StaticFiles(directory=POST_PROCESS_ROOT), name="video-postprocess")
+
+
+def _require_admin_key(request: Request) -> None:
+    """校验积分管理后台访问密钥。
+
+    优先从 `X-Admin-Key` 头读取（Next.js 路由层在转发时会把 cookie 转成头），
+    也接受直接的 `credit_admin_key` cookie，便于 curl/Postman 调试。
+    """
+    expected = (os.getenv("CREDIT_ADMIN_ACCESS_KEY") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ADMIN_KEY_NOT_CONFIGURED", "message": "未配置 CREDIT_ADMIN_ACCESS_KEY"},
+        )
+    provided = (request.headers.get("x-admin-key") or "").strip()
+    if not provided:
+        raw_cookie = request.headers.get("cookie") or ""
+        for chunk in raw_cookie.split(";"):
+            name, _, value = chunk.strip().partition("=")
+            if name == "credit_admin_key":
+                provided = value.strip()
+                break
+    if not provided or provided != expected:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "FORBIDDEN", "message": "未授权的后台访问"},
+        )
 
 # 允许跨域（前端本地调试必须的配置）
 cors_allow_origins_raw = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
@@ -67,6 +109,7 @@ DEEPSEEK_API_KEY = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 RUNNINGHUB_API_KEY = (os.getenv("RUNNINGHUB_API_KEY") or "").strip()
 
 logging.basicConfig(level=logging.INFO)
+ensure_credit_schema()
 
 # ── Pydantic models for video endpoints ──
 
@@ -92,6 +135,9 @@ class TaskStatusResponse(BaseModel):
     video_url: str = ""
     audio_url: str = ""
     cover_url: str = ""
+    cover_status: str = "idle"
+    cover_error: str = ""
+    cover_task_id: str = ""
     post_video_url: str = ""
     post_stage: str = ""
     post_progress: int = 0
@@ -199,6 +245,24 @@ class RewriteRequest(BaseModel):
 
 class AgentRequest(BaseModel):
     prompt: str
+
+
+class CreditConsumeRequest(BaseModel):
+    scene: str
+    cost: int | None = None
+    ref_id: str = ""
+    note: str = ""
+
+
+class RedeemCodeRequest(BaseModel):
+    code: str
+
+
+class RedeemGenerateRequest(BaseModel):
+    amount: int
+    count: int = 1
+    batch_id: str = ""
+    note: str = ""
 
 # --- 接口 2：弹窗 AI 爆改 ---
 @app.post("/api/ai/rewrite")
@@ -334,10 +398,8 @@ def _new_edit_job_id() -> str:
 def _preset_to_bgm_dir(req_bgm_dir: str, preset: str) -> str | None:
     if req_bgm_dir.strip():
         return req_bgm_dir.strip()
-    if preset in {"dynamic", "cinematic", "broll"}:
-        env_dir = (os.getenv("VIDEO_BGM_DIR") or "").strip()
-        return env_dir or None
-    return None
+    env_dir = (os.getenv("VIDEO_BGM_DIR") or "").strip()
+    return env_dir or None
 
 
 def _new_manual_upload_id() -> str:
@@ -352,6 +414,123 @@ def _resolve_manual_upload_path(upload_id: str) -> str:
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="上传文件不存在或已失效")
     return path
+
+
+def _safe_cache_name(task_id: str, fallback: str) -> str:
+    raw = (task_id or fallback or "video").strip()
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", raw).strip("._")
+    return safe or fallback or "video"
+
+
+def _is_http_url(url: str) -> bool:
+    return url.startswith("http://") or url.startswith("https://")
+
+
+async def _download_video_to_project_cache(video_url: str, task_id: str, timeout: float = 180.0) -> str:
+    os.makedirs(GENERATED_VIDEO_CACHE_ROOT, exist_ok=True)
+    safe_name = _safe_cache_name(task_id, f"video_{int(time.time())}")
+    input_path = os.path.join(GENERATED_VIDEO_CACHE_ROOT, f"{safe_name}_input.mp4")
+    tmp_path = f"{input_path}.download"
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        resp = await client.get(video_url)
+        resp.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
+    os.replace(tmp_path, input_path)
+    return input_path
+
+
+def _resolve_project_public_path(video_url: str) -> str:
+    public_url = video_url.split("?", 1)[0].split("#", 1)[0]
+    if not public_url.startswith("/"):
+        raise FileNotFoundError(f"无法识别本地视频地址：{video_url}")
+    rel = public_url.lstrip("/").replace("/", os.sep)
+    candidate = os.path.abspath(os.path.join(PROJECT_PUBLIC_ROOT, rel))
+    public_root = os.path.abspath(PROJECT_PUBLIC_ROOT)
+    if not (candidate == public_root or candidate.startswith(public_root + os.sep)):
+        raise FileNotFoundError("视频地址超出项目 public 目录")
+    if not os.path.exists(candidate):
+        raise FileNotFoundError(f"本地视频文件不存在：{candidate}")
+    return candidate
+
+
+async def _prepare_generated_video_input(video_url: str, task_id: str, output_dir: str) -> tuple[str, bool]:
+    cleaned = (video_url or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="缺少视频地址，无法剪辑")
+    if _is_http_url(cleaned):
+        return await _download_video_to_project_cache(cleaned, task_id), True
+    if cleaned.startswith("/static/video-postprocess/"):
+        rel = cleaned[len("/static/video-postprocess/"):].replace("/", os.sep)
+        candidate = os.path.abspath(os.path.join(POST_PROCESS_ROOT, rel))
+        post_root = os.path.abspath(POST_PROCESS_ROOT)
+        if candidate.startswith(post_root + os.sep) and os.path.exists(candidate):
+            return candidate, False
+    if cleaned.startswith("/"):
+        return _resolve_project_public_path(cleaned), False
+    if os.path.isabs(cleaned) and os.path.exists(cleaned):
+        return cleaned, False
+    input_path = os.path.join(output_dir, "input.mp4")
+    return input_path, False
+
+
+def _cleanup_generated_video_cache(input_path: str, remove_cache: bool) -> None:
+    if not remove_cache:
+        return
+    try:
+        cache_root = os.path.abspath(GENERATED_VIDEO_CACHE_ROOT)
+        target = os.path.abspath(input_path)
+        if target.startswith(cache_root + os.sep) and os.path.exists(target):
+            os.remove(target)
+    except Exception:
+        pass
+
+
+def _pick_first_result_url(result: dict) -> str:
+    for item in result.get("results", []):
+        url = (item or {}).get("url", "")
+        if url:
+            return url
+    return ""
+
+
+async def _run_cover_generation(task_id: str, *, image_url: str, gender: str) -> str:
+    stored = _task_store.get(task_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="视频任务不存在")
+
+    image_url = (image_url or "").strip()
+    if not image_url:
+        raise HTTPException(status_code=400, detail="缺少 image_url，无法生成封面")
+
+    rh = _get_rh_client()
+    cover_prompt = build_cover_prompt(gender)
+    cover_task_id = await rh.submit_cover_image(
+        prompt=cover_prompt,
+        image_urls=[image_url],
+        aspect_ratio="3:4",
+        resolution="1k",
+    )
+    _task_store[task_id] = {
+        **_task_store.get(task_id, {}),
+        "cover_status": "running",
+        "cover_error": "",
+        "cover_task_id": cover_task_id,
+    }
+
+    cover_result = await rh.wait_for_completion(cover_task_id, max_wait=300)
+    cover_url = _pick_first_result_url(cover_result)
+    if not cover_url:
+        raise RunningHubError("封面图生成完成但未返回结果 URL")
+
+    _task_store[task_id] = {
+        **_task_store.get(task_id, {}),
+        "cover_url": cover_url,
+        "cover_status": "success",
+        "cover_error": "",
+        "cover_task_id": cover_task_id,
+    }
+    return cover_url
 
 
 # ── POST /api/video/generate ──────────────────────────────────
@@ -413,6 +592,13 @@ async def video_generate(req: VideoGenerateRequest):
             "image_url": image_url,       # 用于封面图生成
             "gender": req.gender,          # 用于封面图 prompt
             "cover_url": "",               # 封面图 URL（异步填充）
+            "cover_status": "idle",
+            "cover_error": "",
+            "cover_task_id": "",
+            "preset": "smooth",
+            "bgm_dir": "",
+            "bgm_volume": 0.32,
+            "business_card_text": "",
             "error": "",
             "estimated_minutes": 30,
         }
@@ -471,6 +657,10 @@ async def _run_post_process(task_id: str, video_url: str):
             base_dir,
             stored.get("script", ""),
             True,
+            stored.get("business_card_text", ""),
+            stored.get("bgm_dir", ""),
+            stored.get("preset", "smooth"),
+            stored.get("bgm_volume", 0.32),
         )
         if result.ok and result.output_path:
             post_video_url = result.output_path
@@ -555,21 +745,14 @@ async def _poll_video_task(task_id: str):
         if image_url and video_url:
             try:
                 print(f"[cover] Auto-generating cover for task {task_id}")
-                cover_prompt = build_cover_prompt(gender)
-                cover_task_id = await rh.submit_cover_image(
-                    prompt=cover_prompt,
-                    image_urls=[image_url],
-                )
-                cover_result = await rh.wait_for_completion(cover_task_id, max_wait=300)
-                cover_url = ""
-                for r in cover_result.get("results", []):
-                    if r.get("url"):
-                        cover_url = r["url"]
-                        break
-                if cover_url:
-                    _task_store[task_id]["cover_url"] = cover_url
-                    print(f"[cover] Cover generated: {cover_url[:80]}")
+                cover_url = await _run_cover_generation(task_id, image_url=image_url, gender=gender)
+                print(f"[cover] Cover generated: {cover_url[:80]}")
             except Exception as e:
+                _task_store[task_id] = {
+                    **_task_store.get(task_id, {}),
+                    "cover_status": "failed",
+                    "cover_error": str(e),
+                }
                 print(f"[cover] Cover generation failed (non-blocking): {e}")
     except asyncio.CancelledError:
         _task_store[task_id] = {
@@ -661,6 +844,10 @@ async def video_status(taskId: str):
             status=task_status,
             progress=50 if status == "RUNNING" else 0,
             video_url=video_url,
+            cover_url=stored.get("cover_url", "") if stored else "",
+            cover_status=stored.get("cover_status", "idle") if stored else "idle",
+            cover_error=stored.get("cover_error", "") if stored else "",
+            cover_task_id=stored.get("cover_task_id", "") if stored else "",
             post_video_url=stored.get("post_video_url", "") if stored else "",
             post_stage=post_status,
             post_progress=stored.get("post_progress", 0) if stored else 0,
@@ -715,6 +902,8 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
     task_id = req.task_id or edit_job_id
     output_dir = os.path.join(POST_PROCESS_ROOT, task_id, edit_job_id)
     os.makedirs(output_dir, exist_ok=True)
+    cache_input_path = ""
+    should_cleanup_cache = False
     try:
         _edit_task_store[edit_job_id] = {
             **stored,
@@ -758,13 +947,16 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
                 bgm_volume,
             )
         else:
-            input_path = os.path.join(output_dir, "input.mp4")
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.get(req.video_url)
-                resp.raise_for_status()
-                with open(input_path, "wb") as f:
-                    f.write(resp.content)
-            _edit_task_store[edit_job_id]["progress"] = 35
+            if not req.video_url.strip():
+                raise HTTPException(status_code=400, detail="缺少视频地址，无法剪辑")
+            input_path, should_cleanup_cache = await _prepare_generated_video_input(req.video_url, task_id, output_dir)
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"剪辑源视频不存在：{input_path}")
+            cache_input_path = input_path if should_cleanup_cache else ""
+            if should_cleanup_cache:
+                _edit_task_store[edit_job_id]["progress"] = 25
+            else:
+                _edit_task_store[edit_job_id]["progress"] = 35
             result = await asyncio.to_thread(
                 run_ffmpeg_post_process,
                 task_id,
@@ -803,6 +995,8 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
             "output_video_url": "",
             "error": str(e),
         }
+    finally:
+        _cleanup_generated_video_cache(cache_input_path, should_cleanup_cache)
 
 
 @app.post("/api/video/edit", response_model=EditTaskStatusResponse)
@@ -858,32 +1052,26 @@ async def video_manual_edit(req: ManualEditRequest):
 @app.post("/api/video/cover")
 async def video_cover(req: CoverGenerateRequest):
     """独立提交封面图生成任务"""
-    rh = _get_rh_client()
+    task_id = (req.task_id or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="缺少 task_id")
+
+    stored = _task_store.get(task_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="视频任务不存在")
+
     try:
-        image_urls = [req.image_url] if req.image_url else []
-        if not image_urls:
-            stored = _task_store.get(req.task_id, {})
-            img = stored.get("image_url", "")
-            if img:
-                image_urls = [img]
-        if not image_urls:
-            raise HTTPException(status_code=400, detail="缺少参考图片 URL")
-
-        prompt = build_cover_prompt(req.gender)
-        cover_task_id = await rh.submit_cover_image(prompt=prompt, image_urls=image_urls)
-        result = await rh.wait_for_completion(cover_task_id, max_wait=300)
-
-        cover_url = ""
-        for r in result.get("results", []):
-            if r.get("url"):
-                cover_url = r["url"]
-                break
-
-        if req.task_id and req.task_id in _task_store:
-            _task_store[req.task_id]["cover_url"] = cover_url
-
-        return {"cover_url": cover_url, "task_id": cover_task_id, "status": "success"}
+        image_url = (stored.get("image_url") or req.image_url or "").strip()
+        gender = (stored.get("gender") or req.gender or "female").strip() or "female"
+        cover_url = await _run_cover_generation(task_id, image_url=image_url, gender=gender)
+        return {"cover_url": cover_url, "task_id": task_id, "status": "success"}
     except RunningHubError as e:
+        if task_id in _task_store:
+            _task_store[task_id] = {
+                **_task_store.get(task_id, {}),
+                "cover_status": "failed",
+                "cover_error": str(e),
+            }
         raise HTTPException(status_code=e.status_code or 502, detail=str(e))
 
 
@@ -1220,6 +1408,7 @@ async def auth_register(req: RegisterRequest, request: Request, response: Respon
     except ValueError as e:
         raise HTTPException(status_code=400, detail={"code": "REGISTER_FAILED", "message": str(e)}) from e
     ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else ""
     sid = create_session(user_id, ua, ip)
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -1231,7 +1420,12 @@ async def auth_register(req: RegisterRequest, request: Request, response: Respon
         path="/",
     )
     acct = get_account(user_id)
-    return {"user": {"id": user_id, "login_name": login_name}, "balance": acct.balance}
+    user = get_user_identity(user_id) or {
+        "id": user_id,
+        "email_masked": login_name,
+        "login_name": login_name,
+    }
+    return {"user": user, "balance": acct.balance}
 
 
 @app.post("/api/auth/login")
@@ -1249,7 +1443,6 @@ async def auth_login(req: PasswordLoginRequest, request: Request, response: Resp
     if not user_id:
         raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "账号或密码错误"})
     ua = request.headers.get("user-agent", "")
-    ip = request.client.host if request.client else ""
     sid = create_session(user_id, ua, ip)
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -1261,7 +1454,12 @@ async def auth_login(req: PasswordLoginRequest, request: Request, response: Resp
         path="/",
     )
     acct = get_account(user_id)
-    return {"user": {"id": user_id, "login_name": login_name}, "balance": acct.balance}
+    user = get_user_identity(user_id) or {
+        "id": user_id,
+        "email_masked": login_name,
+        "login_name": login_name,
+    }
+    return {"user": user, "balance": acct.balance}
 
 
 @app.post("/api/auth/send-link")
@@ -1367,6 +1565,57 @@ async def credit_ledger(request: Request, limit: int = 20):
     limit = max(1, min(100, limit))
     items = list_ledger(user.id, limit)
     return {"items": items, "count": len(items)}
+
+
+@app.post("/api/credit/consume")
+async def credit_consume(req: CreditConsumeRequest, request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail={"code": "NOT_LOGGED_IN", "message": "未登录"})
+    scene = (req.scene or "").strip()
+    if not scene:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "scene 不能为空"})
+    if scene == "video_creation":
+        cost = VIDEO_CREATION_COST
+    elif scene == "ai_chat":
+        cost = CHAT_COST
+    else:
+        cost = req.cost
+        if cost is None:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_INPUT", "message": "缺少 cost"})
+    new_balance = consume(user.id, cost, ref_id=req.ref_id or scene, note=req.note or scene)
+    return {"balance": new_balance, "cost": cost, "scene": scene}
+
+
+@app.get("/api/credit/redeem-codes")
+async def credit_redeem_codes_admin(request: Request):
+    _require_admin_key(request)
+    return {"amounts": list(REDEEM_CODE_AMOUNTS), "batches": list_redeem_code_batches()}
+
+
+@app.post("/api/credit/redeem-codes/generate")
+async def credit_redeem_codes_generate(req: RedeemGenerateRequest, request: Request):
+    _require_admin_key(request)
+    user = get_current_user(request)
+    created_by = user.id if user else None
+    items = generate_redeem_codes(
+        req.amount,
+        req.count,
+        created_by_user_id=created_by,
+        batch_id=req.batch_id,
+        note=req.note,
+    )
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/credit/redeem")
+async def credit_redeem(req: RedeemCodeRequest, request: Request):
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail={"code": "NOT_LOGGED_IN", "message": "未登录"})
+    result = redeem_code(user.id, req.code)
+    acct = get_account(user.id)
+    return {"result": result, "balance": acct.balance}
 
 
 # ════════════════════════════════════════════════════════════════════════
