@@ -109,6 +109,7 @@ export function GlobalSearchBar({
     智能体: "bg-blue-500/12 text-blue-700 dark:text-blue-300",
     模板: "bg-emerald-500/12 text-emerald-700 dark:text-emerald-300",
     热点: "bg-orange-500/12 text-orange-800 dark:text-orange-200",
+    导航: "bg-violet-500/12 text-violet-700 dark:text-violet-300",
   }
 
   const listId = `global-search-results-${instanceId}`

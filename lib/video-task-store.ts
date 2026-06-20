@@ -213,6 +213,8 @@ export function loadTask(): VideoTaskState | null {
         lastPollError: "",
         videoUrl: "",
         coverUrl: "",
+        createdAt: parsed.createdAt ?? now,
+        submittedAt: parsed.submittedAt ?? now,
         updatedAt: now,
         errorMessage: "检测到上次生成停留在提交阶段且未返回 taskId，当前页面无法恢复该任务，请重新生成。",
       }

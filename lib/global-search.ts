@@ -6,7 +6,7 @@ export type GlobalSearchAction =
 
 export type GlobalSearchItem = {
   id: string
-  kind: "智能体" | "模板" | "热点"
+  kind: "智能体" | "模板" | "热点" | "导航"
   title: string
   subtitle?: string
   /** 参与匹配的文本（小写化后仍支持中文 includes） */
