@@ -30,3 +30,8 @@ tsconfig.tsbuildinfo
 *.db
 *.sqlite
 *.sqlite3
+
+# Local backup files
+.git.backup-*
+node_modules/.cache
+public/agent-*

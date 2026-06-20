@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from lib.runninghub_client import RunningHubClient, RunningHubError, build_motion_prompt, build_cover_prompt
-from lib.video_postprocess import run_ffmpeg_post_process, run_ffmpeg_post_process_from_base64
+from lib.video_postprocess import render_video_with_template
 
 from lib.auth import (
     SESSION_COOKIE, consume_email_token, create_password_user, create_session, destroy_session,
@@ -44,9 +44,14 @@ load_dotenv()
 app = FastAPI()
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJECT_PUBLIC_ROOT = os.path.join(PROJECT_ROOT, "public")
-POST_PROCESS_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-postprocess")
-GENERATED_VIDEO_CACHE_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-cache", "generated")
-MANUAL_UPLOAD_ROOT = os.path.join(PROJECT_PUBLIC_ROOT, "video-cache", "manual-uploads")
+
+# —— 持久化数据目录（生产机挂 Volume 到此路径）——
+# 开发期：默认 <project>/public 子目录
+# 生产期：DATA_DIR=/data（Zeabur Volume 挂载点）
+_DATA_DIR = (os.getenv("DATA_DIR") or "").strip() or os.path.join(PROJECT_PUBLIC_ROOT, "video-cache")
+POST_PROCESS_ROOT = os.path.join(_DATA_DIR, "video-postprocess")
+GENERATED_VIDEO_CACHE_ROOT = os.path.join(_DATA_DIR, "video-cache", "generated")
+MANUAL_UPLOAD_ROOT = os.path.join(_DATA_DIR, "video-cache", "manual-uploads")
 os.makedirs(POST_PROCESS_ROOT, exist_ok=True)
 os.makedirs(GENERATED_VIDEO_CACHE_ROOT, exist_ok=True)
 os.makedirs(MANUAL_UPLOAD_ROOT, exist_ok=True)
@@ -119,6 +124,8 @@ class VideoGenerateRequest(BaseModel):
     audio_base64: str
     script: str
     gender: str = "female"  # "male" | "female" — 用于生成节点 254 的动作描述提示词
+    video_prompt: str = ""
+    video_prompt_mode: str = "natural"
     resolution: str = "720p"
     bg_color: str = ""
 
@@ -169,7 +176,7 @@ class EditVideoRequest(BaseModel):
     video_url: str = ""
     upload_id: str = ""
     video_base64: str = ""
-    preset: str = "smooth"
+    preset: str = "default"
     subtitle_text: str = ""
     business_card_text: str = ""
     bgm_dir: str = ""
@@ -182,7 +189,7 @@ class EditTaskStatusResponse(BaseModel):
     task_id: str = ""
     status: str
     progress: int = 0
-    preset: str = "smooth"
+    preset: str = "default"
     source: str = "generated"
     output_video_url: str = ""
     error: str = ""
@@ -358,6 +365,7 @@ _poll_tasks: dict[str, object] = {}
 _edit_task_store: dict[str, dict] = {}
 _edit_tasks: dict[str, object] = {}
 _manual_upload_store: dict[str, dict] = {}
+_VIDEO_PROMPT_MODES = {"natural", "mode2", "mode3"}
 
 
 def _get_rh_client() -> "RunningHubClient":
@@ -368,6 +376,11 @@ def _get_rh_client() -> "RunningHubClient":
             detail="未配置 RUNNINGHUB_API_KEY。请在项目根目录 .env 中设置后重启服务。",
         )
     return RunningHubClient(RUNNINGHUB_API_KEY)
+
+
+def _normalize_video_prompt_mode(mode: str) -> str:
+    cleaned = (mode or "").strip()
+    return cleaned if cleaned in _VIDEO_PROMPT_MODES else "natural"
 
 
 async def _base64_to_temp_file(b64: str, suffix: str) -> str:
@@ -395,9 +408,14 @@ def _new_edit_job_id() -> str:
     return f"edit_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
 
 
-def _preset_to_bgm_dir(req_bgm_dir: str, preset: str) -> str | None:
-    if req_bgm_dir.strip():
-        return req_bgm_dir.strip()
+def _resolve_bgm_dir(req_bgm_dir: str) -> str | None:
+    """解析 BGM 目录：优先请求参数 → 环境变量 → None。
+
+    与 preset 字段脱钩，单模板时代不再基于 preset 选 BGM 目录。
+    """
+    cleaned = (req_bgm_dir or "").strip()
+    if cleaned:
+        return cleaned
     env_dir = (os.getenv("VIDEO_BGM_DIR") or "").strip()
     return env_dir or None
 
@@ -574,7 +592,10 @@ async def video_generate(req: VideoGenerateRequest):
 
         # 5. 提交视频生成任务
         print(f"[video/generate] Submitting video generation (gender={req.gender})")
-        motion_prompt = build_motion_prompt(req.gender)
+        prompt_mode = _normalize_video_prompt_mode(req.video_prompt_mode)
+        raw_video_prompt = req.video_prompt or ""
+        motion_prompt = build_motion_prompt(req.gender, raw_video_prompt)
+        final_prompt_mode = prompt_mode if raw_video_prompt.strip() else "natural"
         video_task_id = await rh.submit_video(image_url, audio_clone_url, motion_prompt)
 
         # 6. 存储任务状态供后续轮询
@@ -589,13 +610,15 @@ async def video_generate(req: VideoGenerateRequest):
             "post_error": "",
             "audio_url": audio_clone_url,
             "script": req.script,
+            "video_prompt": motion_prompt,
+            "video_prompt_mode": final_prompt_mode,
             "image_url": image_url,       # 用于封面图生成
             "gender": req.gender,          # 用于封面图 prompt
             "cover_url": "",               # 封面图 URL（异步填充）
             "cover_status": "idle",
             "cover_error": "",
             "cover_task_id": "",
-            "preset": "smooth",
+            "preset": "default",
             "bgm_dir": "",
             "bgm_volume": 0.32,
             "business_card_text": "",
@@ -618,6 +641,8 @@ async def video_generate(req: VideoGenerateRequest):
 
     except RunningHubError as e:
         raise HTTPException(status_code=e.status_code or 502, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -651,16 +676,14 @@ async def _run_post_process(task_id: str, video_url: str):
             "estimated_minutes": 0,
         }
         result = await asyncio.to_thread(
-            run_ffmpeg_post_process,
-            task_id,
-            input_path,
-            base_dir,
-            stored.get("script", ""),
-            True,
-            stored.get("business_card_text", ""),
-            stored.get("bgm_dir", ""),
-            stored.get("preset", "smooth"),
-            stored.get("bgm_volume", 0.32),
+            render_video_with_template,
+            task_id=task_id,
+            output_dir=base_dir,
+            script=stored.get("script", ""),
+            business_card_text=stored.get("business_card_text", ""),
+            bgm_dir=_resolve_bgm_dir(stored.get("bgm_dir", "")),
+            bgm_volume=float(stored.get("bgm_volume") or 0.32),
+            input_video_path=input_path,
         )
         if result.ok and result.output_path:
             post_video_url = result.output_path
@@ -916,59 +939,41 @@ async def _run_edit_job(edit_job_id: str, req: EditVideoRequest):
             "output_video_url": "",
             "error": "",
         }
-        bgm_dir = _preset_to_bgm_dir(req.bgm_dir, req.preset)
-        business_card_text = req.business_card_text if req.business_card_text.strip() else ""
-        bgm_volume = max(0.0, min(float(req.bgm_volume), 1.0))
+
+        # ── 输入归一化：3 个分支只产生 input_path（本地文件路径） ──
         if req.upload_id.strip():
             input_path = _resolve_manual_upload_path(req.upload_id)
             _edit_task_store[edit_job_id]["progress"] = 35
-            result = await asyncio.to_thread(
-                run_ffmpeg_post_process,
-                task_id,
-                input_path,
-                output_dir,
-                req.subtitle_text,
-                True,
-                business_card_text,
-                bgm_dir,
-                req.preset,
-                bgm_volume,
-            )
         elif req.video_base64.strip():
-            result = await asyncio.to_thread(
-                run_ffmpeg_post_process_from_base64,
-                task_id,
-                req.video_base64,
-                output_dir,
-                req.subtitle_text,
-                business_card_text,
-                bgm_dir,
-                req.preset,
-                bgm_volume,
-            )
+            input_path = os.path.join(output_dir, f"{task_id}_input.mp4")
+            with open(input_path, "wb") as f:
+                f.write(base64.b64decode(req.video_base64))
+            _edit_task_store[edit_job_id]["progress"] = 35
         else:
             if not req.video_url.strip():
                 raise HTTPException(status_code=400, detail="缺少视频地址，无法剪辑")
-            input_path, should_cleanup_cache = await _prepare_generated_video_input(req.video_url, task_id, output_dir)
+            input_path, should_cleanup_cache = await _prepare_generated_video_input(
+                req.video_url, task_id, output_dir
+            )
             if not os.path.exists(input_path):
                 raise FileNotFoundError(f"剪辑源视频不存在：{input_path}")
             cache_input_path = input_path if should_cleanup_cache else ""
-            if should_cleanup_cache:
-                _edit_task_store[edit_job_id]["progress"] = 25
-            else:
-                _edit_task_store[edit_job_id]["progress"] = 35
-            result = await asyncio.to_thread(
-                run_ffmpeg_post_process,
-                task_id,
-                input_path,
-                output_dir,
-                req.subtitle_text,
-                True,
-                business_card_text,
-                bgm_dir,
-                req.preset,
-                bgm_volume,
-            )
+            _edit_task_store[edit_job_id]["progress"] = 25 if should_cleanup_cache else 35
+
+        # ── 端到端单次 render ──
+        business_card_text = req.business_card_text if req.business_card_text.strip() else ""
+        bgm_volume = max(0.0, min(float(req.bgm_volume), 1.0))
+        result = await asyncio.to_thread(
+            render_video_with_template,
+            task_id=task_id,
+            output_dir=output_dir,
+            script=req.subtitle_text,
+            business_card_text=business_card_text,
+            bgm_dir=_resolve_bgm_dir(req.bgm_dir),
+            bgm_volume=bgm_volume,
+            input_video_path=input_path,
+        )
+
         if result.ok and result.output_path:
             rel_path = os.path.relpath(result.output_path, POST_PROCESS_ROOT).replace(os.sep, "/")
             public_url = f"/static/video-postprocess/{rel_path}"
@@ -1040,7 +1045,7 @@ async def video_manual_edit(req: ManualEditRequest):
         video_url="",
         upload_id=req.upload_id,
         video_base64="",
-        preset="caption",
+        preset="default",
         subtitle_text=req.script,
         business_card_text=req.business_card_text,
         bgm_dir=req.bgm_dir,
@@ -1625,7 +1630,13 @@ async def credit_redeem(req: RedeemCodeRequest, request: Request):
 import sqlite3, uuid as _uuid
 from lib.crypto_utils import encrypt_cookie, decrypt_cookie
 
-_ACCOUNTS_DB = os.path.join(os.path.dirname(__file__), "data", "accounts.db")
+# 与 lib/db.py:DB_PATH 共用同一物理文件：优先读 CREDIT_DB_OVERRIDE 环境变量，
+# 否则用 <project>/data/accounts.db（开发期默认）。
+# 生产机部署：通过 DATA_DIR + CREDIT_DB_OVERRIDE 把 DB 移到 Volume 挂载点。
+_ACCOUNTS_DB = (
+    (os.getenv("CREDIT_DB_OVERRIDE") or "").strip()
+    or os.path.join(os.path.dirname(__file__), "data", "accounts.db")
+)
 
 
 def _init_accounts_db():

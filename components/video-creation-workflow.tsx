@@ -51,6 +51,13 @@ import {
 } from "@/lib/video-task-runtime"
 import { getFastapiBase } from "@/lib/fastapi-base"
 import { getCoverUiState } from "@/lib/video-cover-ui"
+import {
+  DEFAULT_VIDEO_PROMPT_MODE,
+  VIDEO_PROMPT_MODE_LABELS,
+  VIDEO_PROMPT_PRESETS,
+  resolveVideoPrompt,
+  type VideoPromptMode,
+} from "@/lib/video/video-prompt-presets"
 
 type UploadedImage = {
   file: File
@@ -63,13 +70,6 @@ type UploadedAudio = {
   name: string
   duration: string
   base64: string
-}
-
-type EditingPreset = {
-  id: string
-  name: string
-  icon: React.ComponentType<{ className?: string }>
-  description: string
 }
 
 type Props = {
@@ -283,7 +283,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const [coverRetryBusy, setCoverRetryBusy] = React.useState(false)
   const [manualUploadId, setManualUploadId] = React.useState("")
   const [businessCardText, setBusinessCardText] = React.useState(taskState.businessCardText || "")
-  const [bgmVolume, setBgmVolume] = React.useState(taskState.bgmVolume ?? 0.32)
   const pollRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollSessionRef = React.useRef(0)
   const pollInFlightRef = React.useRef(false)
@@ -345,10 +344,18 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
   const setScript = (v: string) => updateTask({ script: v })
   const setGender = (v: "male" | "female") => updateTask({ gender: v })
   const setVideoUrl = (v: string) => updateTask({ videoUrl: v })
-  const setSelectedPreset = (_v: string | null) => updateTask({ selectedPreset: DEFAULT_EDITING_PRESET, editingErrorMessage: "" })
   const setBusinessCardTextState = (v: string) => { setBusinessCardText(v); updateTask({ businessCardText: v }) }
-  const setBgmVolumeState = (v: number) => { setBgmVolume(v); updateTask({ bgmVolume: v }) }
   const setIsEditing = (v: boolean) => updateTask({ isEditing: v })
+  const videoPrompt = taskState.videoPrompt
+  const videoPromptMode = taskState.videoPromptMode
+  const setVideoPrompt = (v: string) => updateTask({ videoPrompt: v })
+  const setVideoPromptMode = (v: VideoPromptMode) => updateTask({ videoPromptMode: v })
+  const applyVideoPromptPreset = React.useCallback((mode: VideoPromptMode) => {
+    updateTask({
+      videoPromptMode: mode,
+      videoPrompt: VIDEO_PROMPT_PRESETS[mode],
+    })
+  }, [updateTask])
 
   const scriptRef = React.useRef(taskState.script)
   scriptRef.current = script
@@ -402,7 +409,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
 
   const imagePreviewSrc = image?.previewUrl || taskState.imagePreview
   const editableVideoUrl = videoUrl || manualVideoPreview
-  React.useEffect(() => { updateTask({ businessCardText, bgmVolume }) }, [businessCardText, bgmVolume, updateTask])
+  React.useEffect(() => { updateTask({ businessCardText }) }, [businessCardText, updateTask])
   const cardInfo: CardInfo = React.useMemo(() => ({
     text: businessCardText,
     placeholder: "例如：张三｜短视频运营｜专注本地生活获客",
@@ -564,7 +571,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
       coverStatus: "idle",
       coverError: "",
       coverTaskId: "",
-      selectedPreset: "",
       resumeGraceUntil: 0,
       pollErrorCount: 0,
       lastPollError: "",
@@ -869,6 +875,8 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           audio_base64: audioBase64,
           script: script.trim(),
           gender,
+          video_prompt: videoPrompt.trim(),
+          video_prompt_mode: videoPromptMode,
         }),
       })
 
@@ -893,26 +901,63 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     } catch (e) {
       failTask(e instanceof Error ? e.message : "生成过程出错，请重新点击生成")
     }
-  }, [audioBase64, canGenerate, failTask, gender, imageBase64, isProcessing, script, startBackgroundPoll, updateTask])
+  }, [audioBase64, canGenerate, failTask, gender, imageBase64, isProcessing, script, startBackgroundPoll, updateTask, videoPrompt, videoPromptMode])
 
   // Keep background polling alive across page/tab switches by not tearing it down on unmount.
   // The poll loop is already guarded by the current taskId/session token, so it can safely
   // continue until completion or explicit cancel/failure.
 
   // 重新挂载时恢复轮询（切页回来时 taskId 还在但 pollRef 已失）
+  // 关键：先立即同步一次状态，确保 lastStatusAt 被刷新，避免健康检查器误判超时
   React.useEffect(() => {
-    if (taskId && workflowUi.shouldResumePolling && !pollRef.current) {
-      const now = Date.now()
-      skipNextHealthCheckRef.current = true
-      if (taskState.resumeGraceUntil < now) {
-        updateTask({ resumeGraceUntil: now + RESUME_POLL_GRACE_MS })
+    if (!(taskId && workflowUi.shouldResumePolling && !pollRef.current)) {
+      if (!workflowUi.shouldResumePolling) {
+        skipNextHealthCheckRef.current = false
+        stopBackgroundPoll()
       }
-      startBackgroundPoll(taskId)
+      return
     }
-    if (!workflowUi.shouldResumePolling) {
-      skipNextHealthCheckRef.current = false
-      stopBackgroundPoll()
+
+    const now = Date.now()
+    skipNextHealthCheckRef.current = true
+    if (taskState.resumeGraceUntil < now) {
+      updateTask({ resumeGraceUntil: now + RESUME_POLL_GRACE_MS })
     }
+
+    // 先发一次即时状态查询，防止上次心跳时间戳过旧被误判超时
+    const base = getFastapiBase()
+    if (base) {
+      let cancelled = false
+      const immediateFetch = async () => {
+        try {
+          const sr = await fetch(`${base}/api/video/status?taskId=${encodeURIComponent(taskId)}`)
+          if (cancelled) return
+          const sd = await sr.json()
+          if (!sr.ok) return
+          const s = sd.status?.toLowerCase()
+          if (s === "success" || s === "failed") {
+            // 后端已完成，直接落地最终状态
+            updateTask({ lastStatusAt: Date.now(), resumeGraceUntil: 0 })
+          } else {
+            // 重置时间戳，给接下来的后台轮询一个干净的起点
+            updateTask({
+              lastStatusAt: Date.now(),
+              lastHeartbeat: Date.now(),
+              pollErrorCount: 0,
+              lastPollError: "",
+            })
+          }
+        } catch {
+          // 即时查询失败不影响恢复流程，后台轮询会兜底
+        }
+      }
+      void immediateFetch().then(() => {
+        if (!cancelled) startBackgroundPoll(taskId)
+      })
+      return () => { cancelled = true }
+    }
+
+    startBackgroundPoll(taskId)
   }, [startBackgroundPoll, stopBackgroundPoll, taskId, taskState.resumeGraceUntil, updateTask, workflowUi.shouldResumePolling])
 
   React.useEffect(() => {
@@ -923,6 +968,8 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
         return
       }
       const snapshot = taskStateRef.current
+      // 恢复宽限期内不触发任何健康检查（切屏回来时给轮询足够时间拿到首次响应）
+      if (snapshot.resumeGraceUntil > Date.now()) return
       const health = getTaskHealth(snapshot)
       if (!health.shouldFail) return
       const message = getTaskHealthMessage(snapshot) || "任务状态异常，已停止自动轮询。"
@@ -1017,7 +1064,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
           preset: selectedPreset,
           subtitle_text: script.trim(),
           business_card_text: businessCardText.trim(),
-          bgm_volume: bgmVolume,
+          bgm_volume: 0.52,
           source: manualUploadId ? "manual" : manualVideoPreview ? "manual" : isLocalPreviewMode ? "manual" : "generated",
         }),
       })
@@ -1069,7 +1116,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
     } finally {
       setIsEditing(false)
     }
-  }, [bgmVolume, businessCardText, isEditing, isLocalPreviewMode, manualUploadId, manualVideoPreview, script, selectedPreset, setIsEditing, setVideoUrl, updateTask, videoUrl])
+  }, [businessCardText, isEditing, isLocalPreviewMode, manualUploadId, manualVideoPreview, script, selectedPreset, setIsEditing, setVideoUrl, updateTask, videoUrl])
 
   const handleRetry = React.useCallback(() => {
     stopBackgroundPoll()
@@ -1239,47 +1286,91 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                 )}
               </div>
 
-              {/* Audio Upload */}
-              <div>
-                {hasAudio ? (
-                  <div className="flex flex-col gap-3 rounded-2xl border border-slate-200/60 bg-white p-5 dark:border-white/10 dark:bg-white/5">
-                    <div className="flex items-center gap-3">
-                      <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-50 dark:bg-rose-500/10">
-                        <Mic className="h-5 w-5 text-rose-400" />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-[13px] font-medium text-slate-700 dark:text-slate-300">
-                          {audioName || "已上传参考音色"}
-                        </p>
-                        <p className="text-[11px] text-slate-400">
-                          {audio?.file
-                            ? `${formatSize(audio.file.size)} · ${audioDuration || "时长未知"}`
-                            : audioDuration
-                              ? `时长 ${audioDuration}`
-                              : "已恢复已上传音频"}
-                        </p>
+              {/* Audio Upload + Video Prompt */}
+              <div className="flex flex-col gap-4">
+                <div>
+                  {hasAudio ? (
+                    <div className="flex flex-col gap-3 rounded-2xl border border-slate-200/60 bg-white p-5 dark:border-white/10 dark:bg-white/5">
+                      <div className="flex items-center gap-3">
+                        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-50 dark:bg-rose-500/10">
+                          <Mic className="h-5 w-5 text-rose-400" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                            {audioName || "已上传参考音色"}
+                          </p>
+                          <p className="text-[11px] text-slate-400">
+                            {audio?.file
+                              ? `${formatSize(audio.file.size)} · ${audioDuration || "时长未知"}`
+                              : audioDuration
+                                ? `时长 ${audioDuration}`
+                                : "已恢复已上传音频"}
+                          </p>
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAudio(null)
+                          updateTask({ audioBase64: "", audioName: "", audioDuration: "" })
+                        }}
+                        className="self-end rounded-lg bg-slate-100 px-3 py-1 text-[11px] text-slate-500 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10"
+                      >
+                        更换
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setAudio(null)
-                        updateTask({ audioBase64: "", audioName: "", audioDuration: "" })
-                      }}
-                      className="self-end rounded-lg bg-slate-100 px-3 py-1 text-[11px] text-slate-500 hover:bg-slate-200 dark:bg-white/5 dark:hover:bg-white/10"
-                    >
-                      更换
-                    </button>
+                  ) : (
+                    <UploadZone
+                      accept={ACCEPTED_AUDIO}
+                      label="上传参考音色"
+                      icon={Mic}
+                      hint="MP3 / WAV / M4A"
+                      onFile={handleAudioFile}
+                    />
+                  )}
+                </div>
+
+                {/* Video Prompt Panel — maps to RunningHub workflow node 254 */}
+                <div className="flex flex-col gap-3 rounded-2xl border border-slate-200/60 bg-white p-5 dark:border-white/10 dark:bg-white/5">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-rose-50 dark:bg-rose-500/10">
+                      <Sparkles className="h-4 w-4 text-rose-400" />
+                    </span>
+                    <div>
+                      <p className="text-[13px] font-medium text-slate-700 dark:text-slate-300">视频提示词</p>
+                      <p className="text-[11px] text-slate-400">用于控制数字人口播时的动作节奏，对应 RunningHub 254 节点</p>
+                    </div>
                   </div>
-                ) : (
-                  <UploadZone
-                    accept={ACCEPTED_AUDIO}
-                    label="上传参考音色"
-                    icon={Mic}
-                    hint="MP3 / WAV / M4A"
-                    onFile={handleAudioFile}
+
+                  <div className="flex flex-wrap gap-2">
+                    {(Object.keys(VIDEO_PROMPT_MODE_LABELS) as VideoPromptMode[]).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => applyVideoPromptPreset(mode)}
+                        className={cn(
+                          "rounded-lg px-3 py-1.5 text-[12px] font-medium transition-colors",
+                          videoPromptMode === mode
+                            ? "bg-rose-500 text-white shadow-sm"
+                            : "bg-slate-100 text-slate-500 hover:bg-slate-200 dark:bg-white/5 dark:text-slate-300 dark:hover:bg-white/10",
+                        )}
+                      >
+                        {VIDEO_PROMPT_MODE_LABELS[mode]}
+                      </button>
+                    ))}
+                  </div>
+
+                  <textarea
+                    rows={11}
+                    value={resolveVideoPrompt(videoPrompt)}
+                    onChange={(e) => setVideoPrompt(e.target.value)}
+                    placeholder={VIDEO_PROMPT_PRESETS[DEFAULT_VIDEO_PROMPT_MODE]}
+                    className="min-h-[220px] w-full resize-none rounded-xl border border-slate-200/60 bg-slate-50/50 p-3 text-[12px] leading-relaxed text-slate-800 placeholder:text-slate-400 focus:border-rose-400 focus:outline-none focus:ring-2 focus:ring-rose-500/15 dark:border-white/5 dark:bg-white/5 dark:text-slate-200"
                   />
-                )}
+                  <p className="text-[11px] text-slate-400">
+                    默认 11 行；可手动编辑后提交，最终内容会同步到 254 节点的 text 字段
+                  </p>
+                </div>
               </div>
 
               {/* Script Input */}
@@ -1736,37 +1827,7 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               </div>
             )}
 
-            <div className="rounded-2xl border border-slate-200/60 bg-white p-4 dark:border-white/10 dark:bg-white/5">
-                <div className="mb-3 flex items-center gap-2">
-                  <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-rose-50 text-rose-500 dark:bg-rose-500/10"><Sparkles className="h-4 w-4" /></span>
-                  <div>
-                    <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">BGM 音量</p>
-                    <p className="text-[12px] text-slate-500 dark:text-slate-400">默认 32%，可按视频风格微调</p>
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  step={1}
-                  value={Math.round((bgmVolume ?? 0.32) * 100)}
-                  onChange={(e) => setBgmVolumeState(Number(e.target.value) / 100)}
-                  className="w-full"
-                />
-                <div className="mt-2 flex items-center justify-between text-[12px] text-slate-500 dark:text-slate-400">
-                  <span>0%</span>
-                  <span>{Math.round((bgmVolume ?? 0.32) * 100)}%</span>
-                  <span>100%</span>
-                </div>
-            </div>
-
             <div className="flex flex-col items-center gap-3 border-t border-slate-100 pt-5 dark:border-white/5">
-              <div className="w-full max-w-xl rounded-2xl border border-slate-200/60 bg-white p-4 text-center dark:border-white/10 dark:bg-white/5">
-                <p className="text-[14px] font-semibold text-slate-800 dark:text-slate-200">默认剪辑效果</p>
-                <p className="mt-1 text-[12px] leading-relaxed text-slate-500 dark:text-slate-400">
-                  自动烧录干净字幕、混入 BGM，并按音频时长裁剪，不调整画面滤镜。
-                </p>
-              </div>
               <Button
                 onClick={() => { void handleApplyEditing() }}
                 disabled={isEditing || !editableVideoUrl || manualUploadBusy}
@@ -1784,11 +1845,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
                   </>
                 )}
               </Button>
-              {!videoUrl && (
-                <p className="text-center text-[12px] text-slate-500 dark:text-slate-400">
-                  请先准备好视频，再应用默认剪辑。
-                </p>
-              )}
               {!isLocalPreviewMode && editingErrorMessage && !isEditing && (
                 <div className="w-full max-w-xl rounded-xl border border-amber-200/60 bg-amber-50/60 p-3 dark:border-amber-500/20 dark:bg-amber-500/5">
                   <div className="flex items-start gap-2">
@@ -1827,27 +1883,6 @@ export function VideoCreationWorkflow({ initialScript }: Props) {
               ) : null}
             </div>
           </section>
-        )}
-
-        {/* ================================================================ */}
-        {/*  Success Banners                                                  */}
-        {/* ================================================================ */}
-        {stepStatuses[3] === "done" && activeStep === 4 && !selectedPreset && (
-          <div className="mt-6 rounded-2xl border border-emerald-200/60 bg-emerald-50/50 p-5 dark:border-emerald-500/20 dark:bg-emerald-500/5">
-            <div className="flex items-start gap-3">
-              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-500" />
-              <div>
-                <p className="text-[14px] font-semibold text-emerald-800 dark:text-emerald-300">
-                  {isLocalPreviewMode ? "已进入本地预览模式" : "视频生成成功！"}
-                </p>
-                <p className="text-[13px] text-emerald-700 dark:text-emerald-400">
-                  {isLocalPreviewMode
-                    ? "当前仅验证界面与预设流程，不会提交后端剪辑任务。"
-                    : "请选择上方预设剪辑效果，AI 将自动完成后期制作。"}
-                </p>
-              </div>
-            </div>
-          </div>
         )}
 
       </div>

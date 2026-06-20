@@ -5,6 +5,8 @@
  * 其他模块（文案创作、热点等）如需引用视频类型应从此处导入。
  */
 
+import type { VideoPromptMode } from "./video-prompt-presets"
+
 /* ================================================================== */
 /*  视频创作（VideoCreationWorkflow）                                     */
 /* ================================================================== */
@@ -89,6 +91,8 @@ export type VideoGenerateRequest = {
   audio_base64: string
   script: string
   gender: VideoGender
+  video_prompt?: string
+  video_prompt_mode?: VideoPromptMode
   resolution?: string
   bg_color?: string
 }

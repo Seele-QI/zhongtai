@@ -44,14 +44,10 @@ POLL_INTERVAL = 5
 MAX_WAIT_SECONDS = 50 * 60
 # 最大重试次数（任务查询失败时）
 MAX_QUERY_RETRIES = 3
+MOTION_PROMPT_LINE_COUNT = 11
 
 
-def build_motion_prompt(gender: str) -> str:
-    """生成视频工作流节点 254 所需的 11 行动作描述提示词。
-
-    每行对应一个视频分段的数字人动作描述，总行数必须为 11。
-    根据数字人性别使用对应的代词。
-    """
+def _default_motion_prompt(gender: str) -> str:
     pronoun = "她" if gender == "female" else "他"
     return (
         f"{pronoun}对着镜头说话。\n"
@@ -66,6 +62,27 @@ def build_motion_prompt(gender: str) -> str:
         f"{pronoun}对着镜头说话，手部自然的摆动\n"
         f"{pronoun}对着镜头说话。\n"
     )
+
+
+def build_motion_prompt(gender: str, custom_prompt: str = "") -> str:
+    """生成视频工作流节点 254 所需的 11 行动作描述提示词。
+
+    每行对应一个视频分段的数字人动作描述，总行数必须为 11。
+    根据数字人性别使用对应的代词。
+    """
+    if not custom_prompt or not custom_prompt.strip():
+        return _default_motion_prompt(gender)
+
+    lines = [
+        line.strip()
+        for line in custom_prompt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip()
+    ]
+    if len(lines) != MOTION_PROMPT_LINE_COUNT:
+        raise ValueError(
+            f"video_prompt 必须是 {MOTION_PROMPT_LINE_COUNT} 行非空文本，当前为 {len(lines)} 行"
+        )
+    return "\n".join(lines)
 
 
 def build_cover_prompt(gender: str) -> str:

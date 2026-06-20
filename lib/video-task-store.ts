@@ -1,3 +1,10 @@
+import {
+  DEFAULT_VIDEO_PROMPT_MODE,
+  VIDEO_PROMPT_PRESETS,
+  resolveVideoPrompt,
+  type VideoPromptMode,
+} from "@/lib/video/video-prompt-presets"
+
 /**
  * 视频创作任务状态持久化层（localStorage）
  * 解决的问题：用户提交视频创作任务后，切换 sidebar 到其他板块，
@@ -49,6 +56,8 @@ export type VideoTaskState = {
   // 输入
   script: string
   gender: "male" | "female"
+  videoPrompt: string
+  videoPromptMode: VideoPromptMode
 
   // 素材
   imageBase64: string
@@ -58,7 +67,6 @@ export type VideoTaskState = {
   audioDuration: string
 
   // 剪辑
-  selectedPreset: string
   businessCardText: string
   bgmVolume: number
   isEditing: boolean
@@ -96,12 +104,16 @@ export type TaskStoreSaveResult =
     errorKind: TaskStoreErrorKind
   }
 
-const DEFAULT_PROGRESS: StageProgress = { voiceClone: 0, videoGen: 0, editing: 0 }
+function createDefaultStageProgress(): StageProgress {
+  return { voiceClone: 0, videoGen: 0, editing: 0 }
+}
+
+const DEFAULT_PROGRESS: StageProgress = createDefaultStageProgress()
 
 const DEFAULT_STATE: Omit<VideoTaskState, "taskId" | "createdAt" | "updatedAt"> = {
   status: "pending",
   progress: 0,
-  stageProgress: DEFAULT_PROGRESS,
+  stageProgress: createDefaultStageProgress(),
   currentStage: "idle",
   lastHeartbeat: 0,
   isProcessing: false,
@@ -113,14 +125,15 @@ const DEFAULT_STATE: Omit<VideoTaskState, "taskId" | "createdAt" | "updatedAt"> 
   coverTaskId: "",
   script: "",
   gender: "female",
+  videoPrompt: VIDEO_PROMPT_PRESETS[DEFAULT_VIDEO_PROMPT_MODE],
+  videoPromptMode: DEFAULT_VIDEO_PROMPT_MODE,
   imageBase64: "",
   imagePreview: "",
   audioBase64: "",
   audioName: "",
   audioDuration: "",
-  selectedPreset: "",
   businessCardText: "",
-  bgmVolume: 0.32,
+  bgmVolume: 0.52,
   isEditing: false,
   editingErrorMessage: "",
   postProcessingStage: "",
@@ -191,7 +204,7 @@ export function loadTask(): VideoTaskState | null {
         currentStage: "failed",
         isProcessing: false,
         progress: 0,
-        stageProgress: { ...DEFAULT_PROGRESS },
+        stageProgress: createDefaultStageProgress(),
         lastHeartbeat: 0,
         lastStatusAt: 0,
         videoStageStartedAt: 0,
@@ -220,6 +233,13 @@ export function loadTask(): VideoTaskState | null {
       coverTaskId: parsed.coverTaskId ?? "",
       businessCardText: parsed.businessCardText ?? "",
       bgmVolume: typeof parsed.bgmVolume === "number" ? parsed.bgmVolume : 0.32,
+      videoPrompt: resolveVideoPrompt(typeof parsed.videoPrompt === "string" ? parsed.videoPrompt : ""),
+      videoPromptMode:
+        parsed.videoPromptMode === "natural" ||
+        parsed.videoPromptMode === "mode2" ||
+        parsed.videoPromptMode === "mode3"
+          ? parsed.videoPromptMode
+          : DEFAULT_VIDEO_PROMPT_MODE,
       createdAt: parsed.createdAt ?? now,
       updatedAt: parsed.updatedAt ?? now,
     }
@@ -234,6 +254,11 @@ function mergeTaskState(state: Partial<VideoTaskState>): VideoTaskState {
     ...DEFAULT_STATE,
     ...prev,
     ...state,
+    stageProgress: state.stageProgress
+      ? { ...state.stageProgress }
+      : prev.stageProgress
+        ? { ...prev.stageProgress }
+        : createDefaultStageProgress(),
     updatedAt: Date.now(),
   }
 }
@@ -303,6 +328,7 @@ export function createNewTask(): VideoTaskState {
   const now = Date.now()
   return {
     ...DEFAULT_STATE,
+    stageProgress: createDefaultStageProgress(),
     taskId: "",
     createdAt: now,
     updatedAt: now,
