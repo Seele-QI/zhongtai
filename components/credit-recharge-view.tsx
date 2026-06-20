@@ -10,13 +10,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
-
-type Balance = {
-  balance: number
-  total_recharged: number
-  total_bonus: number
-  total_consumed: number
-}
+import type { Batch, CreditAccount } from "@/lib/credit-types"
 
 type GeneratedCode = {
   code: string
@@ -34,7 +28,7 @@ function formatTime(ms: number) {
 }
 
 export function CreditRechargeView() {
-  const [balance, setBalance] = React.useState<Balance | null>(null)
+  const [balance, setBalance] = React.useState<CreditAccount | null>(null)
   const [code, setCode] = React.useState("")
   const [redeeming, setRedeeming] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
@@ -50,7 +44,7 @@ export function CreditRechargeView() {
         return
       }
       if (!res.ok) throw new Error("余额加载失败")
-      setBalance((await res.json()) as Balance)
+      setBalance((await res.json()) as CreditAccount)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "余额加载失败")
     } finally {

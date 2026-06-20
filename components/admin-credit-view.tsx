@@ -11,17 +11,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import type { Batch } from "@/lib/credit-types"
 
 const AMOUNTS = [5000, 8000, 10000, 20000, 30000]
-
-type Batch = {
-  batch_id: string
-  amount: number
-  total: number
-  active_count: number
-  redeemed_count: number
-  created_at: number
-}
 
 function formatPoints(value: number) {
   return new Intl.NumberFormat("zh-CN").format(value)

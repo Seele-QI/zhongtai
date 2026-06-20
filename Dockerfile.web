@@ -22,9 +22,9 @@ ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# 构建 standalone 输出（跳过 TypeScript 类型检查以避免 pre-existing 类型错误阻塞部署）
+# 构建 standalone 输出
 RUN corepack enable && corepack prepare pnpm@latest --activate \
-    && NEXT_DISABLE_TYPE_CHECK=1 NEXT_IGNORE_TYPE_ERRORS=1 pnpm run build
+    && pnpm run build
 
 # ── Stage 3: runner（最终镜像，仅含运行所需）──
 FROM node:22-alpine AS runner
